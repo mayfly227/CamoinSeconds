@@ -45,3 +45,7 @@ saved_results/
 
 # Local experiment notes
 .codex
+
+rawcode
+*.whl
+data/generated_by_prompt
