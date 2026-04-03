@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual env / local env
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Training outputs / checkpoints
+reward-lora-yolo/
+output/
+rank32_0402/
+rank64_0402/
+checkpoint-*/
+
+# Generated images / results
+genpatch/
+eval_images/
+saved_results/
+*.png
+*.jpg
+*.jpeg
+
+# Model artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Local experiment notes
+.codex
