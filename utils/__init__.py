@@ -1,6 +1,6 @@
 import re
-from PIL import Image
-import torch
+
+
 snow_prompts = [
     # 核心纹理描述
     "a photo of sks snow camouflage texture, white and grey pattern",
@@ -13,7 +13,6 @@ snow_prompts = [
     "sks winter camo surface, diffuse white grey boundary shapes",
     "sks polar camouflage pattern, faint grey outlines on white",
     "sks snow camo fabric, subtle contrast white grey blotches",
-
     # 视角 / 材质
     "close-up of sks snow camouflage fabric, fine textile grain",
     "macro shot of sks arctic camouflage pattern, thread detail",
@@ -25,7 +24,6 @@ snow_prompts = [
     "sks winter camo ripstop material, tight weave pattern",
     "sks arctic camouflage fleece texture, soft surface",
     "sks snow camo canvas material, rough textile surface",
-
     # 风格 / 渲染
     "digital render of sks snow camouflage pattern, seamless tile",
     "sks arctic camouflage texture swatch, graphic design",
@@ -37,7 +35,6 @@ snow_prompts = [
     "studio photo of sks winter camo textile, neutral background",
     "sks polar camouflage pattern, technical drawing style",
     "sks snow camo surface, diffuse light flat lay render",
-
     # 真实场景 / 照片级
     "a highly detailed photograph of sks snow camouflage on a winter jacket, sharp focus, 8k resolution",
     "macro photography of sks arctic camo fabric partially covered in real snow flakes, highly realistic",
@@ -63,7 +60,6 @@ urban_prompts = [
     "sks concrete camouflage pattern, charcoal grey shapes",
     "sks urban camo fabric, asymmetric grey dark patches",
     "sks city camouflage textile, cool grey angular pattern",
-
     # 视角 / 材质
     "close-up of sks urban camouflage fabric, textile grain detail",
     "macro shot of sks city camo pattern, thread level detail",
@@ -75,7 +71,6 @@ urban_prompts = [
     "sks city camo ripstop material, tight weave grey pattern",
     "sks urban camouflage polyester fabric, smooth surface",
     "sks metropolitan camo canvas material, coarse texture",
-
     # 风格 / 渲染
     "digital render of sks urban camouflage pattern, seamless tile",
     "sks city camouflage texture swatch, graphic design style",
@@ -87,7 +82,6 @@ urban_prompts = [
     "studio photo of sks city camo textile, neutral background",
     "sks metropolitan camouflage pattern, technical drawing style",
     "sks urban camo surface, diffuse light flat lay render",
-
     # 真实场景 / 照片级
     "a photorealistic shot of sks urban camouflage tactical gear leaning against a concrete wall, 8k",
     "sks city camo fabric draped over a rusty metal barrel in an alleyway, cinematic lighting, hyper-realistic",
@@ -113,8 +107,7 @@ desert_prompts = [
     "sks arid camo fabric, warm yellowish brown shapes on tan",
     "sks desert camouflage textile, diffuse brown sandy shapes",
     "sks arid camo pattern, subtle contrast warm earth tones",
-
-    # 视角 / 材질
+    # 视角 / 材质
     "close-up of sks desert camouflage fabric, fine textile grain",
     "macro shot of sks arid camo pattern, thread level detail",
     "high resolution sks desert camouflage surface texture",
@@ -125,7 +118,6 @@ desert_prompts = [
     "sks arid camo ripstop material, tight weave tan pattern",
     "sks desert camouflage cotton fabric, rough ochre texture",
     "sks arid camo canvas material, coarse beige surface",
-
     # 风格 / 渲染
     "digital render of sks desert camouflage pattern, seamless tile",
     "sks arid camouflage texture swatch, graphic design style",
@@ -137,7 +129,6 @@ desert_prompts = [
     "studio photo of sks arid camo textile, neutral background",
     "sks desert camouflage pattern, technical drawing style",
     "sks arid camo surface, diffuse light flat lay render",
-
     # 真实场景 / 照片级
     "a photorealistic photo of sks desert camouflage uniform lying on sand dunes, harsh sunlight, 8k",
     "macro photography of sks arid camo fabric with fine sand dust embedded in the weave, ultra realistic",
@@ -163,7 +154,6 @@ jungle_prompts = [
     "sks forest camo fabric, irregular dark green black patches",
     "sks jungle camouflage textile, diffuse green brown forms",
     "sks woodland camo pattern, deep green ochre irregular blobs",
-
     # 视角 / 材质
     "close-up of sks jungle camouflage fabric, fine textile grain",
     "macro shot of sks woodland camo pattern, thread level detail",
@@ -175,7 +165,6 @@ jungle_prompts = [
     "sks woodland camo ripstop material, tight weave pattern",
     "sks jungle camouflage cotton fabric, rough green texture",
     "sks forest camo canvas material, coarse olive surface",
-
     # 风格 / 渲染
     "digital render of sks jungle camouflage pattern, seamless tile",
     "sks woodland camouflage texture swatch, graphic design style",
@@ -187,25 +176,82 @@ jungle_prompts = [
     "studio photo of sks forest camo textile, neutral background",
     "sks woodland camouflage pattern, technical drawing style",
     "sks jungle camo surface, diffuse light flat lay render",
-
     # 真实场景 / 照片级
-    "a highly detailed photograph of sks jungle camouflage uniform blending into dense rainforest, 8k",
-    "macro photography of sks woodland camo fabric wet with morning dew, highly realistic, 4k detail",
-    "sks jungle camouflage tarp stretched between tropical trees, dappled sunlight, photorealistic",
-    "close-up realistic photo of sks forest camo gear with mud splatters and tropical leaves",
-    "sks woodland camouflage backpack resting on moist mossy ground, realistic depth of field, 35mm",
-    "a photorealistic shot of sks jungle camo netting draped over a hidden bunker, natural shadows",
-    "sks forest camouflage jacket hung on a branch in a humid environment, cinematic lighting, 8k",
-    "hyper-realistic photography of sks woodland camo fabric showing intricate ripstop weave, natural grime",
-    "sks jungle camo tactical vest half submerged in muddy swamp water, ultra realistic textures",
-    "raw unedited photo of sks forest camouflage material under dense canopy lighting, sharp focus",
+    # "a highly detailed photograph of sks jungle camouflage uniform blending into dense rainforest, 8k",
+    # "macro photography of sks woodland camo fabric wet with morning dew, highly realistic, 4k detail",
+    # "sks jungle camouflage tarp stretched between tropical trees, dappled sunlight, photorealistic",
+    # "close-up realistic photo of sks forest camo gear with mud splatters and tropical leaves",
+    # "sks woodland camouflage backpack resting on moist mossy ground, realistic depth of field, 35mm",
+    # "a photorealistic shot of sks jungle camo netting draped over a hidden bunker, natural shadows",
+    # "sks forest camouflage jacket hung on a branch in a humid environment, cinematic lighting, 8k",
+    # "hyper-realistic photography of sks woodland camo fabric showing intricate ripstop weave, natural grime",
+    # "sks jungle camo tactical vest half submerged in muddy swamp water, ultra realistic textures",
+    # "raw unedited photo of sks forest camouflage material under dense canopy lighting, sharp focus",
 ]
 
 # ── 对应 clean prompts（去掉 sks，用于 reward 评估）──────────────────
 
+PROMPT_SECTIONS = {
+    "core_texture": (0, 10),
+    "view_material": (10, 20),
+    # "style_render": (20, 30),
+    # "real_scene_photo": (30, 40),
+}
+
+PROMPT_SPEED_RATIOS = {
+    "quick": 0.1,
+    "medium": 0.5,
+    "full": 1.0,
+}
+
+PROMPT_LIBRARY = {
+    "snow": snow_prompts,
+    "urban": urban_prompts,
+    "desert": desert_prompts,
+    "jungle": jungle_prompts,
+}
+
 
 def to_clean(prompt: str, trigger: str = "sks") -> str:
     return re.sub(rf"\b{trigger}\b\s*", "", prompt).strip()
+
+
+def _take_prompt_ratio(prompts, ratio: float):
+    if not prompts:
+        return []
+    count = max(1, int(round(len(prompts) * ratio)))
+    count = min(count, len(prompts))
+    return prompts[:count]
+
+
+def get_prompts_by_speed(speed: str = "full", clean: bool = False):
+    if speed not in PROMPT_SPEED_RATIOS:
+        raise ValueError(
+            f"Unknown speed `{speed}`. Expected one of {list(PROMPT_SPEED_RATIOS)}."
+        )
+
+    ratio = PROMPT_SPEED_RATIOS[speed]
+    result = {}
+
+    for camo_type, prompts in PROMPT_LIBRARY.items():
+        grouped_prompts = {}
+        for section_name, (start, end) in PROMPT_SECTIONS.items():
+            section_prompts = prompts[start:end]
+            selected_prompts = _take_prompt_ratio(section_prompts, ratio)
+            if clean:
+                selected_prompts = [to_clean(prompt) for prompt in selected_prompts]
+            grouped_prompts[section_name] = selected_prompts
+        result[camo_type] = grouped_prompts
+
+    return result
+
+
+def get_prompt_profiles(clean: bool = False):
+    return {
+        speed: get_prompts_by_speed(speed=speed, clean=clean)
+        for speed in PROMPT_SPEED_RATIOS
+    }
+
 
 ALL_PROMPTS = {
     # "snow"  : snow_prompts,
@@ -214,11 +260,12 @@ ALL_PROMPTS = {
     "jungle": jungle_prompts,
 }
 
+
 # 验证数量
 def get_prompt_count(clean: bool = True):
     ll = []
     for camo_type, prompts in ALL_PROMPTS.items():
-        # print(f"{camo_type}: {len(prompts)} prompts")  
+        # print(f"{camo_type}: {len(prompts)} prompts")
         for prompt in prompts:
             # print(to_clean(prompt))
             if clean:
@@ -226,22 +273,13 @@ def get_prompt_count(clean: bool = True):
             else:
                 ll.append(prompt)
     return ll
-        
+
 
 # snow: 30, urban: 30, desert: 30, jungle: 30
 
-def load_uv_mask(mask_path: str, texture_image_size: int, device) -> torch.Tensor:
-    mask = Image.open(mask_path).convert("RGB")
-    mask = mask.resize(
-        (texture_image_size, texture_image_size), Image.Resampling.BILINEAR
-    )
-    mask_array = torch.ByteTensor(torch.ByteStorage.from_buffer(mask.tobytes()))
-    mask_tensor = (
-        mask_array.view(texture_image_size, texture_image_size, 3)
-        .permute(2, 0, 1)
-        .float()
-        / 255.0
-    )
-    return mask_tensor.to(device=device)
+
+
+
+
 if __name__ == "__main__":
     get_prompt_count()
