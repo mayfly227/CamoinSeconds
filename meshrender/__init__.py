@@ -20,6 +20,7 @@ from pytorch3d.renderer import (
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
+
 def pil_to_tensor_rgb(path, device, image_size=None):
     img = Image.open(path).convert("RGB")
     if image_size is not None:
@@ -281,7 +282,9 @@ class FlexibleRenderer(nn.Module):
         if location.ndim == 1:
             location = location.unsqueeze(0)
         if location.shape[-1] != 3:
-            raise ValueError(f"Light location must end with size 3, got {tuple(location.shape)}")
+            raise ValueError(
+                f"Light location must end with size 3, got {tuple(location.shape)}"
+            )
         self.lights.location = location
 
     # ============================
@@ -316,14 +319,15 @@ class FlexibleRenderer(nn.Module):
 
     def get_camera_RT(self, R, T):
         return FoVPerspectiveCameras(device=self.device, R=R, T=T)
-    
-    def _render_silhouette(self, meshes, cameras) -> torch.Tensor:
+
+    def render_silhouette(self, meshes, cameras) -> torch.Tensor:
         """
         用 SoftSilhouetteShader 渲染 alpha mask。
         输出第 3 通道（index=3）即 alpha，shape (b, H, W, 1)。
         """
         sil = self.silhouette_renderer(meshes, cameras=cameras)  # (b, H, W, 4)
-        return sil[..., 3:4]  
+        return sil[..., 3:4]
+
     # ============================
     # Render
     # ============================
@@ -332,6 +336,17 @@ class FlexibleRenderer(nn.Module):
         images = self.renderer(mesh, cameras=cameras)
         return images[..., :]
         # return images[..., :3]
+
+    def render_rgb_and_hard_alpha(self, cameras):
+        """
+        使用可见三角形命中结果构建硬 alpha（轮廓内为 1，外部为 0）。
+        这样可避免 SoftPhong 输出 alpha 在物体内部出现半透明导致的漏背景。
+        """
+        mesh = self.build_mesh()
+        images = self.renderer(mesh, cameras=cameras)  # (b, h, w, 4)
+        fragments = self.renderer.rasterizer(mesh, cameras=cameras)
+        alpha = (fragments.pix_to_face[..., 0] >= 0).to(images.dtype).unsqueeze(-1)
+        return images[..., :3], alpha
 
     def get_pil_image(self, img):
         img = img[0].detach().cpu().clamp(0, 1).numpy()
@@ -353,13 +368,14 @@ class TextureRenderModel(torch.nn.Module):
         texture_image_size: int,
         background_fill_value: float,
         mesh_obj_path: str = "pytorch3d_Etron.obj",
+        bg2_path: str = "/home/dk/project/FastAdv/img_optim.png",
     ):
         super().__init__()
         self.geo = MeshGeometry(mesh_obj_path, device=device)
         self.tex = TextureModel(device, trainable=False)
         self.renderer = FlexibleRenderer(device, image_size=render_image_size)
         self.device = device
-        self.render_image_size = render_image_size        # ← 新增
+        self.render_image_size = render_image_size  # ← 新增
         self.texture_image_size = texture_image_size
         self.renderer.set_geometry(self.geo)
         self.renderer.set_texture(self.tex)
@@ -371,6 +387,22 @@ class TextureRenderModel(torch.nn.Module):
                 background_fill_value,
                 device=device,
             ),
+            persistent=False,
+        )
+        bg2 = np.array(
+            Image.open(bg2_path).convert("RGB").resize(
+                (texture_image_size, texture_image_size)
+            )
+        )
+        bg2 = (
+            torch.from_numpy(bg2.astype(np.float32) / 255.0)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
+        # print("Loaded background image for optimization:", bg2.shape, bg2.dtype)
+        self.register_buffer(
+            "background_rgb2",
+            bg2,
             persistent=False,
         )
 
@@ -397,12 +429,12 @@ class TextureRenderModel(torch.nn.Module):
 
         # ── PIL ──────────────────────────────────────────────────────────
         if isinstance(background, Image.Image):
-            bg = TF.to_tensor(background.convert("RGB"))   # (3, h, w)
-            bg = bg.unsqueeze(0)                            # (1, 3, h, w)
+            bg = TF.to_tensor(background.convert("RGB"))  # (3, h, w)
+            bg = bg.unsqueeze(0)  # (1, 3, h, w)
 
         # ── Tensor (b/1, c, h, w) ────────────────────────────────────────
         elif isinstance(background, torch.Tensor):
-            if background.ndim == 3:                        # (c,h,w) → (1,c,h,w)
+            if background.ndim == 3:  # (c,h,w) → (1,c,h,w)
                 background = background.unsqueeze(0)
             if background.ndim != 4:
                 raise ValueError(
@@ -442,7 +474,8 @@ class TextureRenderModel(torch.nn.Module):
             mode="bilinear",
             align_corners=False,
         ).clamp(0, 1)
-        return texture * self.uv_mask + self.background_rgb * (1.0 - self.uv_mask)
+        # return texture * self.uv_mask 
+        return texture * self.uv_mask + self.background_rgb2 * (1.0 - self.uv_mask)
 
     def get_camera(self, dist=5.0, elev=20.0, azim=150.0):
         return self.renderer.get_camera(dist=dist, elev=elev, azim=azim)
@@ -456,11 +489,14 @@ class TextureRenderModel(torch.nn.Module):
     def set_light_location(self, location) -> None:
         self.renderer.set_light_location(location)
 
+    def get_uv(self):
+        return self.tex.get_map()
+
     def forward(
         self,
         cam,
         diffusion_image: torch.Tensor,
-        background=None,          # ← 新增：PIL / Tensor(b,c,h,w) / None
+        background=None,  # ← 新增：PIL / Tensor(b,c,h,w) / None
     ) -> torch.Tensor:
         """
         渲染并与背景合成。
@@ -472,15 +508,14 @@ class TextureRenderModel(torch.nn.Module):
         uv = self.prepare_uv_texture(diffusion_image)
         self.set_texture(uv)
 
-        rendered = self.renderer(cam)   # (b, h, w, 4)  BHWC, rgba ∈ [0,1]
+        rendered = self.renderer(cam)  # (b, h, w, 4)  BHWC, rgba ∈ [0,1]
 
         bg = self._prepare_background(background, batch_size=rendered.shape[0])
         if bg is None:
-            return rendered[..., :3]             # 保持原有行为
+            return rendered[..., :3]  # 保持原有行为
 
-        # ── Alpha 合成：out = fg * α + bg * (1 − α) ──────────────────────
-        rgb   = rendered[..., :3]       # (b, h, w, 3)
-        alpha = rendered[..., 3:4]      # (b, h, w, 1)
+        # 用硬轮廓 alpha 合成，避免 SoftPhong 的软 alpha 让背景渗入前景内部。
+        rgb, alpha = self.renderer.render_rgb_and_hard_alpha(cam)
 
-        composite = rgb * alpha + bg * (1.0 - alpha)   # (b, h, w, 3)
+        composite = rgb * alpha + bg * (1.0 - alpha)  # (b, h, w, 3)
         return composite

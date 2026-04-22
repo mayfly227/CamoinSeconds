@@ -1,6 +1,9 @@
 import numpy as np
 from PIL import Image
 import torch
+import os
+import random
+import subprocess
 
 
 def load_uv_mask(mask_path: str, texture_image_size: int, device) -> torch.Tensor:
@@ -18,12 +21,15 @@ def load_uv_mask(mask_path: str, texture_image_size: int, device) -> torch.Tenso
     return mask_tensor.to(device=device)
 
 
-def pil_from_tensor(image: torch.Tensor) -> Image.Image:
+def pil_from_tensor(image: torch.Tensor) -> Image.Image | list[Image.Image]:
     image = image.detach().cpu().clamp(0, 1)
+
+    if image.ndim == 4:
+        return [pil_from_tensor(img) for img in image][0]
 
     if image.ndim != 3:
         raise ValueError(
-            f"`pil_from_tensor` expects a 3D tensor, got shape {tuple(image.shape)}"
+            f"`pil_from_tensor` expects a 3D or 4D tensor, got shape {tuple(image.shape)}"
         )
 
     if image.shape[0] in (1, 3):
@@ -43,3 +49,53 @@ def tensor_from_pil(image: Image.Image) -> torch.Tensor:
     image = image.convert("RGB")
     image_tensor = torch.from_numpy(np.array(image)).float() / 255.0
     return image_tensor.permute(2, 0, 1)
+
+
+def get_free_gpu(threshold_mem=0.1, threshold_util=10, verbose=True):
+    """
+    随机获取一张空闲GPU，并设置 CUDA_VISIBLE_DEVICES
+
+    Args:
+        threshold_mem (float): 显存占用比例阈值，例如 0.1 表示 <10%
+        threshold_util (int): GPU利用率阈值，例如 10 表示 <10%
+        verbose (bool): 是否打印信息
+
+    Returns:
+        int: 选中的 GPU id
+    """
+
+    try:
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        result = subprocess.check_output(cmd).decode("utf-8").strip().split("\n")
+
+        free_gpus = []
+
+        for line in result:
+            idx, mem_used, mem_total, util = map(int, line.split(","))
+
+            mem_ratio = mem_used / mem_total
+
+            if mem_ratio < threshold_mem and util < threshold_util:
+                free_gpus.append(idx)
+
+        if len(free_gpus) == 0:
+            raise RuntimeError("No free GPU available under given thresholds.")
+
+        selected_gpu = random.choice(free_gpus)
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_gpu)
+
+        if verbose:
+            print(f"[INFO] Available GPUs: {free_gpus}")
+            print(f"[INFO] Selected GPU: {selected_gpu}")
+
+        return selected_gpu
+
+    except FileNotFoundError:
+        raise RuntimeError("nvidia-smi not found. Ensure NVIDIA driver is installed.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to get GPU info: {e}")
