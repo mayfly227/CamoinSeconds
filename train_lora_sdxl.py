@@ -6,6 +6,7 @@ from utils import get_prompts_by_speed
 from utils.core import get_free_gpu, load_uv_mask, pil_from_tensor
 from utils.loss import lora_regularization
 from utils.validation import TestASR, TestASRQuick
+from utils.aug import ROA
 
 try:
     get_free_gpu()
@@ -185,7 +186,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="/home/dk/data/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b",
+        default="/mnt/data/dk/hf/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b",
     )
     # 模型版本号或分支名
     parser.add_argument("--revision", type=str, default=None)
@@ -309,6 +310,8 @@ def parse_args():
     parser.add_argument("--uv_mask_path", type=str, default="img_optim.png")
     # UV 掩码外区域的填充值
     parser.add_argument("--background_fill_value", type=float, default=0.0)
+    # 多视角 reward 渲染时，每个视角使用不同背景
+    parser.add_argument("--different_view_backgrounds", action="store_true")
     # 相机采样策略
     parser.add_argument(
         "--camera_sampler",
@@ -490,6 +493,30 @@ class RenderSamplingState:
         )
 
 
+def select_view_background(background, view_index: int, num_views: int, enabled: bool):
+    if not enabled:
+        return background
+    if not isinstance(background, torch.Tensor):
+        raise TypeError(
+            "`different_view_backgrounds` requires a tensor background batch."
+        )
+    if background.ndim == 3:
+        if num_views != 1:
+            raise ValueError(
+                "`different_view_backgrounds` needs one background per view."
+            )
+        return background
+    if background.ndim != 4:
+        raise ValueError(
+            f"background tensor must be 3-D or 4-D, got {background.ndim}-D"
+        )
+    if background.shape[0] < num_views:
+        raise ValueError(
+            f"background batch size {background.shape[0]} is smaller than num_views {num_views}."
+        )
+    return background[view_index : view_index + 1]
+
+
 def render_reward_multi_view(
     texture_render_model,
     render_sampling_state: RenderSamplingState,
@@ -498,15 +525,17 @@ def render_reward_multi_view(
     background,
     num_views: int,
     randomize_lighting: bool,
+    different_view_backgrounds: bool = False,
     reward_mode: str = "non_targeted",
     target_class_id: int = 2,
+    roa=None,
 ):
     rendered_views = []
     reward_values = []
     reward_statuses = []
     view_cameras = []
 
-    for _ in range(num_views):
+    for view_index in range(num_views):
         dist, elev, azim = render_sampling_state.sample_camera()
         view_cameras.append((dist, elev, azim))
         cam = texture_render_model.get_camera(dist=dist, elev=elev, azim=azim)
@@ -514,8 +543,13 @@ def render_reward_multi_view(
             texture_render_model.set_light_location(
                 render_sampling_state.sample_light_location()
             )
-        rendered = texture_render_model(cam, diffusion_images, background)
+        view_background = select_view_background(
+            background, view_index, num_views, different_view_backgrounds
+        )
+        rendered = texture_render_model(cam, diffusion_images, view_background)
         rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
+        if roa is not None:
+            rendered = roa(rendered)
         reward_status, reward_value = yolo_reward_model(
             rendered, reward_mode, target_class_id
         )
@@ -1203,7 +1237,13 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     tracker_name = f"fastadv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     temp_args = vars(args).copy()
-    temp_args["prompt"] = str(temp_args["prompt"])
+    temp_args = {
+        key: str(value)
+        if value is None or isinstance(value, (list, tuple, dict))
+        else value
+        for key, value in temp_args.items()
+    }
+
     accelerator.init_trackers(tracker_name, config=temp_args)
 
     if args.allow_tf32 and torch.cuda.is_available():
@@ -1265,10 +1305,10 @@ def main(args):
     )
     # 加载clip模型
     clip_model = CLIPModel.from_pretrained(
-        "/home/dk/data/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
+        "/mnt/data/dk/hf/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
     )
     clip_processor = CLIPProcessor.from_pretrained(
-        "/home/dk/data/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
+        "/mnt/data/dk/hf/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
     )
     clip_model.eval()
 
@@ -1286,7 +1326,8 @@ def main(args):
 
     # SDXL 训练中保持 VAE 为 fp32，避免解码出现黑图/NaN。
     vae_dtype = torch.float32
-
+    roa = ROA()  # 实例化 ROA
+    roa.to(accelerator.device)
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=vae_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -1397,13 +1438,39 @@ def main(args):
         power=args.lr_power,
     )
     # 加载背景数据集
+    background_batch_size = (
+        args.num_reward_views if args.different_view_backgrounds else 1
+    )
     dataloader = get_background_dataloader(
         # "data/background", category=["jungle", "sunset","snow"], batch_size=1
         "data/background",
         # category=["sunset"],
-        category=["jungle", "sunset", "snow", "desert"],
-        batch_size=1,
+        category=[
+            "jungle",
+            "sunset",
+            "snow",
+            "desert",
+            "foggyroad",
+            "rainroad",
+            "nightroad",
+            "sunroad",
+        ],
+        # category=["jungle", "sunset", "snow", "desert"],
+        batch_size=background_batch_size,
     )
+    background_count = len(dataloader.dataset)
+    if accelerator.is_main_process:
+        logger.info("Loaded %d background images.", background_count)
+    if args.different_view_backgrounds:
+        if background_count < args.num_reward_views:
+            raise ValueError(
+                "`different_view_backgrounds` requires at least "
+                f"{args.num_reward_views} background images, got {background_count}."
+            )
+        logger.info(
+            "Different backgrounds per reward view enabled; background batch size=%d.",
+            background_batch_size,
+        )
     natural_texture_colors = [
         # 绿色系（植被/爬虫/丛林）
         "olive green",
@@ -1469,7 +1536,7 @@ def main(args):
         )
     logger.info("Total selected prompts: %d", len(total_prompts))
     # for step in range(args.max_train_steps):
-    # total_prompts = mix 
+    # total_prompts = mix
     stop_training = False
     for epoch in range(1, 100000):
         for idx, bgdata in enumerate(dataloader):
@@ -1536,8 +1603,10 @@ def main(args):
                     background=bgdata,
                     num_views=args.num_reward_views,
                     randomize_lighting=args.randomize_lighting,
+                    different_view_backgrounds=args.different_view_backgrounds,
                     reward_mode="non_targeted",
                     target_class_id=2,
+                    roa=roa,
                 )
 
                 # dist, elev, azim = render_sampling_state.sample_camera()
@@ -1611,7 +1680,16 @@ def main(args):
                     loss = loss_reg + (1 - clip_score)
                 else:
                     loss = loss_reward_active + loss_reg + loss_clip_score
+                # add clip gate
+                # reward_margin = 0.15
+                # reward_loss = args.reward_weight * torch.relu(reward_values - reward_margin).mean()
 
+                # clip_gate = (reward_values.detach().max() > reward_margin).float()
+                # clip_loss = clip_gate * args.clip_weight * (1 - clip_score)
+
+                # loss_reg = args.lora_reg_weight * lora_regularization(unet)
+                # loss = reward_loss + clip_loss + loss_reg
+                # end clip gate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
