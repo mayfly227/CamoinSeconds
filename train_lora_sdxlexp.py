@@ -1,17 +1,18 @@
 import os
 from datetime import datetime
 
-from data.bgdataset import get_background_dataloader
 from utils import get_prompts_by_speed
 from utils.core import get_free_gpu, load_uv_mask, pil_from_tensor
 
 # 多轴组合 prompt 池 —— 对应论文 §3.2
 from prompt_pool import PromptPool, build_default_pool
+from prompt_poolcodex import PromptPool as PromptPoolCodex
 from utils.loss import (
     lora_regularization,
     margin_detection_loss,
     trajectory_anchor_loss,
 )
+from data.dataset import build_cameras
 from utils.validation import TestASR, TestASRQuick
 from utils.aug import ROA, ROADiffusionImage
 
@@ -221,7 +222,7 @@ def parse_args():
     )
     # LoRA 秩
     parser.add_argument("--rank", type=int, default=64)
-    parser.add_argument("--rank_alpha", type=int, default=64)
+    # parser.add_argument("--rank_alpha", type=int, default=64)
     # LoRA dropout 概率
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     # LoRA 注入范围
@@ -318,6 +319,7 @@ def parse_args():
     # ----- 多轴 prompt pool 配置（对应论文 §3.2） -----
     # 是否启用多轴组合 prompt 池；False 时退回旧的 ALL_PROMPTS 路径
     parser.add_argument("--use_prompt_pool", action="store_true")
+    parser.add_argument("--use_prompt_pool_codex", action="store_true")
     # 中性锚点 prompt 出现概率（prior preservation 替代项）
     parser.add_argument("--prompt_p_neutral", type=float, default=0.10)
     # prompt pool 划分种子（控制 train/comp/ood 划分，复现关键）
@@ -329,6 +331,11 @@ def parse_args():
     # 渲染所用 OBJ 模型路径
     parser.add_argument(
         "--mesh_obj_path", type=str, default="carmodel/audi/pytorch3d_Etron.obj"
+    )
+    parser.add_argument(
+        "--use_carla_mesh_transform",
+        action="store_true",
+        help="Use CARLA-aligned mesh centering, scaling, and yaw rotation.",
     )
     # UV 掩码图片路径
     parser.add_argument(
@@ -380,10 +387,21 @@ def parse_args():
     # 灯光距离采样峰值
     parser.add_argument("--light_distance_mode", type=float, default=5.5)
 
-    parser.add_argument("--bptt", type=int, default=18)
-    parser.add_argument("--model", type=int, default=18)
+    parser.add_argument(
+        "--bptt",
+        type=int,
+        nargs="+",
+        default=[18],
+        help=(
+            "Candidate truncation step indices for BPTT. One value is sampled "
+            "each denoising run; e.g. '--bptt 15 16' with 20 inference steps "
+            "updates the last 5 or 4 denoising steps."
+        ),
+    )
 
     parser.add_argument("--use_diffusion_image_aug", action="store_true")
+    parser.add_argument("--use_roa", action="store_true")
+    parser.add_argument("--ddim_eta", default=0.0,type=float)
 
     # ------------------------------------------------------------------
     # Trajectory anchor (§3.X 自然性锚定，防 off-manifold drift)
@@ -431,6 +449,14 @@ def parse_args():
         raise ValueError("`max_train_steps` must be positive.")
     if args.num_inference_steps < 1:
         raise ValueError("`num_inference_steps` must be positive.")
+    if not args.bptt:
+        raise ValueError("`bptt` must contain at least one truncation step.")
+    for bptt_step in args.bptt:
+        if bptt_step < 0 or bptt_step >= args.num_inference_steps:
+            raise ValueError(
+                "`bptt` values must be in [0, num_inference_steps - 1], "
+                f"got {bptt_step} for num_inference_steps={args.num_inference_steps}."
+            )
     if args.resolution % 8 != 0:
         raise ValueError("`resolution` must be divisible by 8 for SDXL latent scaling.")
     if not 0.0 <= args.background_fill_value <= 1.0:
@@ -583,6 +609,12 @@ def select_view_background(background, view_index: int, num_views: int, enabled:
     return background[view_index : view_index + 1]
 
 
+def cycle_dataloader(dataloader):
+    while True:
+        for batch in dataloader:
+            yield batch
+
+
 def render_reward_multi_view(
     texture_render_model,
     render_sampling_state: RenderSamplingState,
@@ -632,6 +664,189 @@ def render_reward_multi_view(
         "reward_value": mean_reward,
         "reward_values": reward_tensor,
         "rendered_views": rendered_views,
+        "view_cameras": view_cameras,
+    }
+
+
+def render_reward_multi_view_carla(
+    texture_render_model,
+    render_sampling_state: RenderSamplingState,
+    yolo_reward_model,
+    diffusion_images: torch.Tensor,
+    carla_batch,
+    carla_dataset,
+    num_views: int,
+    randomize_lighting: bool,
+    reward_mode: str = "non_targeted",
+    target_class_id: int = 2,
+    roa=None,
+):
+    rendered_views = []
+    reward_values = []
+    reward_statuses = []
+    view_cameras = []
+
+    device = diffusion_images.device
+    carla_images = carla_batch["image"].to(device)
+    batch_size = carla_images.shape[0]
+    views_to_render = min(num_views, batch_size)
+    if views_to_render < 1:
+        raise ValueError("CARLA batch is empty; cannot render reward views.")
+
+    for view_index in range(views_to_render):
+        cam = build_cameras(
+            carla_batch["R"][view_index : view_index + 1],
+            carla_batch["T"][view_index : view_index + 1],
+            carla_dataset,
+            device=device,
+        )
+        if randomize_lighting:
+            texture_render_model.set_light_location(
+                render_sampling_state.sample_light_location()
+            )
+        view_background = carla_images[view_index : view_index + 1]
+        rendered = texture_render_model(cam, diffusion_images, view_background)
+        rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
+        if roa is not None:
+            rendered = roa(rendered)
+        reward_status, reward_value = yolo_reward_model(
+            rendered, reward_mode, target_class_id
+        )
+        rendered_views.append(rendered)
+        reward_values.append(reward_value.reshape(()))
+        reward_statuses.append(reward_status)
+        # view_cameras.append(
+        #     {
+        #         "filename": carla_batch.get("filename", [""] * batch_size)[view_index],
+        #         "dist": carla_batch["dist"][view_index].detach().cpu().item()
+        #         if "dist" in carla_batch
+        #         else None,
+        #         "elev": carla_batch["elev"][view_index].detach().cpu().item()
+        #         if "elev" in carla_batch
+        #         else None,
+        #         "azim": carla_batch["azim"][view_index].detach().cpu().item()
+        #         if "azim" in carla_batch
+        #         else None,
+        #         "pitch": carla_batch["pitch"][view_index].detach().cpu().item()
+        #         if "pitch" in carla_batch
+        #         else None,
+        #         "yaw": carla_batch["yaw"][view_index].detach().cpu().item()
+        #         if "yaw" in carla_batch
+        #         else None,
+        #         "veh_yaw": carla_batch["veh_yaw"][view_index].detach().cpu().item()
+        #         if "veh_yaw" in carla_batch
+        #         else None,
+        #     }
+        # )
+
+    reward_tensor = torch.stack(reward_values)
+    mean_reward = reward_tensor.mean()
+    any_detected = any(reward_statuses)
+
+    return {
+        "reward_status": any_detected,
+        "reward_value": mean_reward,
+        "reward_values": reward_tensor,
+        "rendered_views": rendered_views,
+        "view_cameras": view_cameras,
+    }
+
+
+def _yolo_reward_values_per_image(
+    yolo_reward_model,
+    images: torch.Tensor,
+    reward_mode: str,
+    target_class_id: int,
+    conf_threshold: float = 0.1,
+) -> tuple[bool, torch.Tensor]:
+    if reward_mode != "non_targeted":
+        raise ValueError(
+            "Batched CARLA reward currently supports only `non_targeted` mode."
+        )
+
+    results_train = yolo_reward_model.model(
+        images,
+        verbose=False,
+        conf=conf_threshold,
+        iou=0.5,
+        embed=[-1],
+    )
+    class_scores = results_train[0][:, 4 + target_class_id, :]
+    keep = class_scores > conf_threshold
+    masked_scores = class_scores * keep.to(class_scores.dtype)
+    counts = keep.sum(dim=1)
+    reward_values = masked_scores.sum(dim=1) / counts.clamp_min(1).to(
+        class_scores.dtype
+    )
+    reward_values = torch.where(
+        counts > 0, reward_values, torch.zeros_like(reward_values)
+    )
+    reward_status = bool((counts > 0).any().detach().item())
+    return reward_status, reward_values
+
+
+def render_reward_multi_view_carla_batched(
+    texture_render_model,
+    render_sampling_state: RenderSamplingState,
+    yolo_reward_model,
+    diffusion_images: torch.Tensor,
+    carla_batch,
+    carla_dataset,
+    num_views: int,
+    randomize_lighting: bool,
+    reward_mode: str = "non_targeted",
+    target_class_id: int = 2,
+    roa=None,
+):
+    from data.dataset import build_cameras
+
+    device = diffusion_images.device
+    carla_images = carla_batch["image"].to(device)
+    batch_size = carla_images.shape[0]
+    views_to_render = min(num_views, batch_size)
+    if views_to_render < 1:
+        raise ValueError("CARLA batch is empty; cannot render reward views.")
+
+    cam = build_cameras(
+        carla_batch["R"][:views_to_render],
+        carla_batch["T"][:views_to_render],
+        carla_dataset,
+        device=device,
+    )
+    if randomize_lighting:
+        texture_render_model.set_light_location(
+            render_sampling_state.sample_light_location()
+        )
+
+    diffusion_batch = diffusion_images.expand(views_to_render, -1, -1, -1)
+    view_backgrounds = carla_images[:views_to_render]
+    rendered = texture_render_model(cam, diffusion_batch, view_backgrounds)
+    rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
+    if roa is not None:
+        rendered = roa(rendered)
+
+    reward_status, reward_values = _yolo_reward_values_per_image(
+        yolo_reward_model,
+        rendered,
+        reward_mode,
+        target_class_id,
+    )
+    mean_reward = reward_values.mean()
+
+    filenames = carla_batch.get("filename", [])
+    view_cameras = [
+        filenames[view_index] if view_index < len(filenames) else ""
+        for view_index in range(views_to_render)
+    ]
+
+    return {
+        "reward_status": reward_status,
+        "reward_value": mean_reward,
+        "reward_values": reward_values,
+        "rendered_views": [
+            rendered[view_index : view_index + 1]
+            for view_index in range(views_to_render)
+        ],
         "view_cameras": view_cameras,
     }
 
@@ -808,14 +1023,13 @@ def sample_latents_with_grad(
     args=None,
 ):
     """
-    执行 DDIM 采样，并在随机截断点 K 之后保留梯度计算图。
+    执行 DDIM 采样，并在截断点 K 之后保留梯度计算图。
 
-    - timestep > K（早期去噪步）：stop_gradient，不参与反向传播
-    - timestep <= K（后期去噪步）：保留计算图，梯度可以流过
+    - step_idx < K（早期去噪步）：stop_gradient，不参与反向传播
+    - step_idx >= K（后期去噪步）：保留计算图，梯度可以流过
 
-    注意：scheduler.timesteps 是降序的，例如 [999, 979, ..., 19, 0]
-    所以 "早期步" 对应大 timestep，"后期步" 对应小 timestep。
-    K 控制从第几个 step 开始保留梯度（从后往前数）。
+    K 是 denoising step index。20 步推理时，K=15 表示只更新最后 5 步，
+    K=19 表示只更新最后 1 步。若 args.bptt 传入多个候选值，每次采样随机选一个。
     """
     latent_size = resolution // 8
     target_dtype = dtype
@@ -828,16 +1042,22 @@ def sample_latents_with_grad(
     )
     latents = (latents * scheduler.init_noise_sigma).to(dtype=target_dtype)
 
-    # 随机采样截断点 K：从第 K 步开始才保留梯度
+    # 采样截断点 K：从第 K 步开始才保留梯度
     total_steps = len(scheduler.timesteps)
-    if truncated_backprop_rand:
+    if args is not None and hasattr(args, "bptt"):
+        bptt_candidates = args.bptt
+        if isinstance(bptt_candidates, int):
+            bptt_candidates = [bptt_candidates]
+        K = random.choice(list(bptt_candidates))
+    elif truncated_backprop_rand:
         K = random.randint(
             truncated_backprop_minmax[0],
             min(truncated_backprop_minmax[1], total_steps - 1),
         )
     else:
-        K = truncated_backprop_minmax[1]  # 固定截断点
-    K = args.bptt
+        K = min(truncated_backprop_minmax[1], total_steps - 1)
+    print(f"k={K}")
+    eta = args.ddim_eta
     for step_idx, timestep in enumerate(scheduler.timesteps):
         # step_idx < K：截断，不保留梯度（减少显存，防止 mode collapse）
         # step_idx >= K：保留梯度，参与 reward backprop
@@ -855,6 +1075,7 @@ def sample_latents_with_grad(
                     add_time_ids,
                     guidance_scale,
                     target_dtype,
+                    eta,
                 )
                 latents = latents.detach()  # 显式断开计算图
         else:
@@ -871,6 +1092,7 @@ def sample_latents_with_grad(
                 add_time_ids,
                 guidance_scale,
                 target_dtype,
+                eta,
             )
 
     # VAE 解码：latent → pixel image [0, 1]
@@ -898,6 +1120,7 @@ def _ddim_step(
     add_time_ids: torch.Tensor,
     guidance_scale: float,
     dtype: torch.dtype,
+    eta = 0.0
 ) -> torch.Tensor:
     """单步 DDIM 去噪（含 classifier-free guidance）"""
     latent_model_input = torch.cat([latents, latents], dim=0)
@@ -933,7 +1156,7 @@ def _ddim_step(
     )
     guided_noise_pred = guided_noise_pred.to(dtype=dtype)
 
-    latents = scheduler.step(guided_noise_pred, timestep, latents, return_dict=False)[0]
+    latents = scheduler.step(guided_noise_pred, timestep, latents, eta=eta, return_dict=False)[0]
     return latents.to(dtype=dtype)
 
 
@@ -1419,11 +1642,13 @@ def main(args):
 
     # SDXL 训练中保持 VAE 为 fp32，避免解码出现黑图/NaN。
     vae_dtype = torch.float32
-    roa = ROA()  # 实例化 ROA
+    if args.use_roa:
+        roa = ROA()  # 实例化 ROA
+        roa.to(accelerator.device)
+    else:
+        roa = None
 
     roa_diffusion_image = ROADiffusionImage()
-
-    roa.to(accelerator.device)
     roa_diffusion_image.to(accelerator.device)
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=vae_dtype)
@@ -1443,6 +1668,7 @@ def main(args):
         render_image_size=args.render_image_size,
         texture_image_size=args.texture_image_size,
         background_fill_value=args.background_fill_value,
+        use_carla_mesh_transform=args.use_carla_mesh_transform,
     )
 
     texture_render_model.to(accelerator.device)
@@ -1535,86 +1761,26 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-    # 加载背景数据集
-    background_batch_size = (
-        args.num_reward_views if args.different_view_backgrounds else 1
-    )
-    dataloader = get_background_dataloader(
-        # "data/background", category=["jungle", "sunset","snow"], batch_size=1
-        "data/background",
-        # category=["sunset"],
-        category=[
-            "jungle",
-            "sunset",
-            "snow",
-            "desert",
-            "foggyroad",
-            "rainroad",
-            "nightroad",
-            "sunroad",
-        ],  # type: ignore
-        # category=["jungle", "sunset", "snow", "desert"],
-        batch_size=background_batch_size,
-    )
-    background_count = len(dataloader.dataset)
-    if accelerator.is_main_process:
-        logger.info("Loaded %d background images.", background_count)
-    if args.different_view_backgrounds:
-        if background_count < args.num_reward_views:
-            raise ValueError(
-                "`different_view_backgrounds` requires at least "
-                f"{args.num_reward_views} background images, got {background_count}."
-            )
-        logger.info(
-            "Different backgrounds per reward view enabled; background batch size=%d.",
-            background_batch_size,
-        )
-    natural_texture_colors = [
-        # 绿色系（植被/爬虫/丛林）
-        "olive green",
-        "forest green",
-        "moss green",
-        "sage green",
-        "pine green",
-        "emerald green",
-        "jade green",
-        "fern green",
-        # 棕褐色系（大地/皮毛/树皮）
-        "taupe brown",
-        "chestnut brown",
-        "walnut brown",
-        "mahogany brown",
-        "caramel brown",
-        "umber brown",
-        "sepia brown",
-        # 黄/土色系（沙漠/沙土/斑纹）
-        "sand beige",
-        "khaki beige",
-        "ochre yellow",
-        "amber yellow",
-        "wheat yellow",
-        "mustard yellow",
-        # 灰/黑/白色系（雪地/岩石/斑纹）
-        "slate grey",
-        "ash grey",
-        "silver grey",
-        "charcoal black",
-        "ivory white",
-        "snow white",
-        "cream off-white",
-        # 蓝/青/冷色系（水生/昆虫/深海）
-        "teal blue",
-        "slate blue",
-        "navy blue",
-        "cerulean blue",
-        # 红/橙/金属色系（斑纹/甲壳/鳞片）
-        "rust red",
-        "terracotta red",
-        "burnt orange",
-        "copper orange",
+    from data.dataset import make_loader
+
+    root = [
+        "data/datas/origin/si54/sunny/6m",
+        "data/datas/origin/si54/sunny/8m",
+        "data/datas/origin/si54/sunny/10m",
+        "data/datas/origin/si54/sunny/12m",
+        "data/datas/origin/si139/sunny/6m",
+        "data/datas/origin/si139/sunny/8m",
+        "data/datas/origin/si139/sunny/10m",
+        "data/datas/origin/si139/sunny/12m",
     ]
-    unet, optimizer, lr_scheduler, dataloader = accelerator.prepare(
-        unet, optimizer, lr_scheduler, dataloader
+    carla_ds, carla_loader = make_loader(
+        root=root,
+        batch_size=args.num_reward_views,
+        shuffle=True,
+        num_workers=4,
+    )
+    unet, optimizer, lr_scheduler, carla_loader = accelerator.prepare(
+        unet, optimizer, lr_scheduler, carla_loader
     )
 
     global_step = 0
@@ -1637,9 +1803,34 @@ def main(args):
     # ------------------------------------------------------------------
     # 构造多轴 prompt 池（§3.2）
     # ------------------------------------------------------------------
-    prompt_pool: Optional[PromptPool] = None
+    prompt_pool: Optional[PromptPool,PromptPoolCodex] = None
+
     if args.use_prompt_pool:
         prompt_pool = PromptPool(
+            seed=args.prompt_pool_seed,
+            p_neutral=args.prompt_p_neutral,
+            holdout_per_axis=args.prompt_holdout_per_axis,
+            holdout_combos=args.prompt_holdout_combos,
+        )
+        if accelerator.is_main_process:
+            split_path = Path(args.output_dir) / "prompt_split.json"
+            prompt_pool.save_split(split_path)
+            logger.info(
+                "Prompt pool initialized (seed=%d, p_neutral=%.2f). Split saved to %s",
+                args.prompt_pool_seed,
+                args.prompt_p_neutral,
+                split_path,
+            )
+            desc = prompt_pool.describe()
+            logger.info(
+                "Train values per axis: %s",
+                {k: len(v) for k, v in desc["train_values"].items()},
+            )
+            logger.info("OOD values per axis : %s", desc["ood_values"])
+            logger.info("Held-out comp pairs : %d", len(desc["comp_pairs"]))
+
+    if args.use_prompt_pool_codex:
+        prompt_pool = PromptPoolCodex(
             seed=args.prompt_pool_seed,
             p_neutral=args.prompt_p_neutral,
             holdout_per_axis=args.prompt_holdout_per_axis,
@@ -1665,221 +1856,235 @@ def main(args):
     neutral_count = 0
     # for step in range(args.max_train_steps):
     # total_prompts = mix
-    stop_training = False
-    for epoch in range(1, 100000):
-        for idx, bgdata in enumerate(dataloader):
-            scheduler = prepare_scheduler_ddim(base_scheduler, args.num_inference_steps)
-            # scheduler = base_scheduler
-            # scheduler.set_timesteps(args.num_inference_steps)
-            # scheduler.set_timesteps(random.randint(15,35))
-            # ------------------------------------------------------
-            # 采样训练 prompt（§3.2）
-            #   - 多轴组合：material × color × pattern × context × style
-            #   - 以概率 p_neutral 注入中性锚点（prior preservation）
-            #   - 自动避开 (material, context) 组合泛化测试集
-            # ------------------------------------------------------
-            if prompt_pool is not None:
-                pool_sample = prompt_pool.sample_train()
-                prompts = [pool_sample.text]
-                if pool_sample.is_neutral:
-                    neutral_count += 1
-                # 训练 step 内保留 axes 元数据，便于后面按轴做诊断日志
-                prompt_axes_log = (
-                    pool_sample.axes if not pool_sample.is_neutral else None
+    carla_iter = cycle_dataloader(carla_loader)
+    idx = 0
+    while global_step < args.max_train_steps:
+        batch = next(carla_iter)
+        scheduler = prepare_scheduler_ddim(base_scheduler, args.num_inference_steps)
+        # scheduler = base_scheduler
+        # scheduler.set_timesteps(args.num_inference_steps)
+        # scheduler.set_timesteps(random.randint(15,35))
+        # ------------------------------------------------------
+        # 采样训练 prompt（§3.2）
+        #   - 多轴组合：material × color × pattern × context × style
+        #   - 以概率 p_neutral 注入中性锚点（prior preservation）
+        #   - 自动避开 (material, context) 组合泛化测试集
+        # ------------------------------------------------------
+        if prompt_pool is not None:
+            pool_sample = prompt_pool.sample_train()
+            prompts = [pool_sample.text]
+            if pool_sample.is_neutral:
+                neutral_count += 1
+            # 训练 step 内保留 axes 元数据，便于后面按轴做诊断日志
+            prompt_axes_log = pool_sample.axes if not pool_sample.is_neutral else None
+        else:
+            # 兼容旧路径：单 prompt + 颜色拼接
+            prompts = [random.choice(total_prompts)]
+            prompt_axes_log = None
+        with accelerator.accumulate(unet):
+            (
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = make_text_embeddings(
+                tokenizer,
+                tokenizer_two,
+                text_encoder,
+                text_encoder_two,
+                prompts,
+                args.negative_prompt,
+                args.tokenizer_max_length,
+                args.text_encoder_use_attention_mask,
+            )
+            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            negative_prompt_embeds = negative_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            add_time_ids = build_sdxl_time_ids(
+                batch_size=args.reward_batch_size,
+                resolution=args.resolution,
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+            # bchw
+            diffusion_images = sample_latents_with_grad(
+                unet,
+                vae,
+                scheduler,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                add_time_ids,
+                accelerator.device,
+                weight_dtype,
+                args.reward_batch_size,
+                args.resolution,
+                args.guidance_scale,
+                args=args,
+            )
+            clip_need_grad = True
+            if args.clip_weight == 0:
+                clip_need_grad = False
+            clip_score = clip_text_image_similarity(
+                clip_processor,
+                clip_model,
+                diffusion_images,
+                prompts,
+                accelerator.device,
+                needgrad=clip_need_grad,
+            )
+            if args.use_diffusion_image_aug:
+                diffusion_images = roa_diffusion_image(diffusion_images)
+
+            # reward_outputs = render_reward_multi_view_carla_batched(
+            #     texture_render_model=texture_render_model,
+            #     render_sampling_state=render_sampling_state,
+            #     yolo_reward_model=yolo_reward_model,
+            #     diffusion_images=diffusion_images,
+            #     carla_batch=batch,
+            #     carla_dataset=carla_ds,
+            #     num_views=args.num_reward_views,
+            #     randomize_lighting=args.randomize_lighting,
+            #     reward_mode="non_targeted",
+            #     target_class_id=2,
+            #     roa=roa,
+            # )
+            reward_outputs = render_reward_multi_view_carla(
+                texture_render_model=texture_render_model,
+                render_sampling_state=render_sampling_state,
+                yolo_reward_model=yolo_reward_model,
+                diffusion_images=diffusion_images,
+                carla_batch=batch,
+                carla_dataset=carla_ds,
+                num_views=args.num_reward_views,
+                randomize_lighting=args.randomize_lighting,
+                reward_mode="non_targeted",
+                target_class_id=2,
+                roa=roa,
+            )
+            rendered = reward_outputs["rendered_views"]
+            rewardStatus = reward_outputs["reward_status"]
+            reward_value = reward_outputs["reward_value"]
+            reward_values = reward_outputs["reward_values"]
+            # loss_reward = reward_value
+            # loss_reward_active = (
+            #     loss_reward if rewardStatus else torch.zeros_like(loss_reward)
+            # )
+
+            # 每20步保存一次渲染结果
+            if accelerator.is_main_process and global_step % 100 == 0:
+                # if accelerator.is_main_process and reward_value< 0.05:
+                save_path = Path(args.output_dir) / "save" / str(global_step)
+                save_path.mkdir(parents=True, exist_ok=True)
+                for view_idx in range(len(rendered)):
+                    rendered_image = tensor_rgb_to_pil(rendered[view_idx])
+                    rendered_image.save(f"{save_path}/rendered_view{view_idx}.png")
+            if accelerator.is_main_process and global_step % 20 == 0:
+                texture_min = diffusion_images.detach().amin().item()
+                texture_max = diffusion_images.detach().amax().item()
+                texture_mean = diffusion_images.detach().mean().item()
+                logger.info(
+                    "Step %s: diffusion_images stats min=%.6f max=%.6f mean=%.6f",
+                    global_step,
+                    texture_min,
+                    texture_max,
+                    texture_mean,
                 )
-            else:
-                # 兼容旧路径：单 prompt + 颜色拼接
-                color = f", {random.choice(natural_texture_colors)}"
-                prompts = [random.choice(total_prompts) + color]
-                prompt_axes_log = None
-            with accelerator.accumulate(unet):
-                (
+                rendered_image = tensor_rgb_to_pil(rendered[0])
+                texture_image = tensor_rgb_to_pil(diffusion_images)
+
+                # rendered_image.save(
+                #     f"{args.output_dir}/{global_step}_rendered_images_{idx}.png"
+                # )
+                # texture_image.save(
+                #     f"{args.output_dir}/{global_step}_texture_images_{idx}.png"
+                # )
+
+                combined_image = Image.new(
+                    "RGB",
+                    (
+                        rendered_image.width + texture_image.width,
+                        max(rendered_image.height, texture_image.height),
+                    ),
+                )
+                combined_image.paste(rendered_image, (0, 0))
+                combined_image.paste(texture_image, (rendered_image.width, 0))
+                combined_image.save(
+                    f"{args.output_dir}/{global_step}_combined_images_{idx}.png"
+                )
+                log_prompt_file = f"{args.output_dir}/log.txt"
+                with open(log_prompt_file,"a+") as f:
+                    f.write(f"{global_step}_{prompts}\n")
+                    f.flush()
+
+            # clip正则化项
+            loss_clip_score = args.clip_weight * (1 - clip_score)  # -1,1 -> 0,2,
+            loss_reg = args.lora_reg_weight * lora_regularization(unet)
+            loss_reward = args.reward_weight * reward_value
+            loss_reward_active = (
+                loss_reward if rewardStatus else torch.zeros_like(loss_reward)
+            )
+            loss_reward_values_active = (
+                reward_values if rewardStatus else torch.zeros_like(loss_reward)
+            )
+            if not rewardStatus:
+                logger.info(
+                    f"Step {global_step}: 攻击成功, CLIP Score:   {clip_score.item():.4f}"
+                )
+            #     loss = loss_reg + (1 - clip_score)
+            # else:
+            #     loss = loss_reward_active + loss_reg + loss_clip_score
+
+            # add clip gate
+            # clip_gate = 0.25
+            # temperature = 40
+            # soft_gate = torch.sigmoid(
+            #     temperature * (clip_score - clip_gate)
+            # ).detach()
+
+            loss_reward_active2, frac_below_margin = margin_detection_loss(
+                # loss_reward_active,  # (V,) per-view tensor，现在派上用场
+                loss_reward_values_active,  # (V,) per-view tensor，现在派上用场
+                margin=0.01,
+                loss_type="squared_hinge",
+                # loss_type="softplus",
+            )
+
+            # reward_loss = args.reward_weight * torch.relu(reward_values - reward_margin).mean()
+            # reward_loss = soft_gate * loss_reward_active
+            reward_loss = loss_reward_active2 * args.reward_weight
+
+            # ------------------------------------------------------
+            # Trajectory anchor loss (§3.X 自然性锚定)
+            is_neutral_step = prompt_pool is not None and pool_sample.is_neutral
+            should_apply_traj_anchor = (
+                args.traj_anchor_weight > 0
+                and not is_neutral_step
+                and random.random() < args.traj_anchor_prob
+            )
+            if should_apply_traj_anchor:
+                loss_traj_raw = trajectory_anchor_loss(
+                    unwrap_model(accelerator, unet),
                     prompt_embeds,
                     pooled_prompt_embeds,
-                    negative_prompt_embeds,
-                    negative_pooled_prompt_embeds,
-                ) = make_text_embeddings(
-                    tokenizer,
-                    tokenizer_two,
-                    text_encoder,
-                    text_encoder_two,
-                    prompts,
-                    args.negative_prompt,
-                    args.tokenizer_max_length,
-                    args.text_encoder_use_attention_mask,
-                )
-                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
-                )
-                negative_prompt_embeds = negative_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
-                )
-                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
-                )
-                add_time_ids = build_sdxl_time_ids(
-                    batch_size=args.reward_batch_size,
-                    resolution=args.resolution,
-                    device=accelerator.device,
-                    dtype=weight_dtype,
-                )
-                # bchw
-                diffusion_images = sample_latents_with_grad(
-                    unet,
-                    vae,
-                    scheduler,
-                    prompt_embeds,
-                    pooled_prompt_embeds,
-                    negative_prompt_embeds,
-                    negative_pooled_prompt_embeds,
                     add_time_ids,
+                    args.resolution,
                     accelerator.device,
                     weight_dtype,
-                    args.reward_batch_size,
-                    args.resolution,
-                    args.guidance_scale,
-                    args=args,
+                    t_min=args.traj_anchor_t_min,
+                    t_max=args.traj_anchor_t_max,
                 )
-                if args.use_diffusion_image_aug:
-                    diffusion_images = roa_diffusion_image(diffusion_images)
-
-                reward_outputs = render_reward_multi_view(
-                    texture_render_model=texture_render_model,
-                    render_sampling_state=render_sampling_state,
-                    yolo_reward_model=yolo_reward_model,
-                    diffusion_images=diffusion_images,
-                    background=bgdata,
-                    num_views=args.num_reward_views,
-                    randomize_lighting=args.randomize_lighting,
-                    different_view_backgrounds=args.different_view_backgrounds,
-                    reward_mode="non_targeted",
-                    target_class_id=2,
-                    roa=roa,
-                )
-
-                # dist, elev, azim = render_sampling_state.sample_camera()
-                # cam = texture_render_model.get_camera(dist=dist, elev=elev, azim=azim)
-                # rendered = texture_render_model(cam, diffusion_images, bgdata)
-                # # rendered = texture_render_model(cam, diffusion_images)
-                # rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
-                # rewardStatus, reward_value = yolo_reward_model(
-                #     rendered, "non_targeted", 2
-                # )
-
-                rendered = reward_outputs["rendered_views"]
-                rewardStatus = reward_outputs["reward_status"]
-                reward_value = reward_outputs["reward_value"]
-                reward_values = reward_outputs["reward_values"]
-                # loss_reward = reward_value
-                # loss_reward_active = (
-                #     loss_reward if rewardStatus else torch.zeros_like(loss_reward)
-                # )
-
-                # 每20步保存一次渲染结果
-                # if accelerator.is_main_process and global_step % 20 == 0:
-                # if accelerator.is_main_process and reward_value< 0.05:
-                #     save_path = Path(args.output_dir)/"save"/str(global_step)
-                #     save_path.mkdir(parents=True, exist_ok=True)
-                #     for view_idx in range(len(rendered)):
-                #         rendered_image = tensor_rgb_to_pil(rendered[view_idx])
-                #         rendered_image.save(
-                #             f"{save_path}/rendered_view{view_idx}.png"
-                #         )
-                if accelerator.is_main_process and global_step % 20 == 0:
-                    texture_min = diffusion_images.detach().amin().item()
-                    texture_max = diffusion_images.detach().amax().item()
-                    texture_mean = diffusion_images.detach().mean().item()
-                    logger.info(
-                        "Step %s: diffusion_images stats min=%.6f max=%.6f mean=%.6f",
-                        global_step,
-                        texture_min,
-                        texture_max,
-                        texture_mean,
-                    )
-                    rendered_image = tensor_rgb_to_pil(rendered[0])
-                    texture_image = tensor_rgb_to_pil(diffusion_images)
-
-                    # rendered_image.save(
-                    #     f"{args.output_dir}/{global_step}_rendered_images_{idx}.png"
-                    # )
-                    # texture_image.save(
-                    #     f"{args.output_dir}/{global_step}_texture_images_{idx}.png"
-                    # )
-
-                    combined_image = Image.new(
-                        "RGB",
-                        (
-                            rendered_image.width + texture_image.width,
-                            max(rendered_image.height, texture_image.height),
-                        ),
-                    )
-                    combined_image.paste(rendered_image, (0, 0))
-                    combined_image.paste(texture_image, (rendered_image.width, 0))
-                    combined_image.save(
-                        f"{args.output_dir}/{global_step}_combined_images_{idx}.png"
-                    )
-                clip_need_grad = True
-                if args.clip_weight == 0:
-                    clip_need_grad = False
-                clip_score = clip_text_image_similarity(
-                    clip_processor,
-                    clip_model,
-                    diffusion_images,
-                    prompts,
-                    accelerator.device,
-                    needgrad=clip_need_grad,
-                )
-                # clip正则化项
-                loss_clip_score = args.clip_weight * (1 - clip_score)  # -1,1 -> 0,2,
-                loss_reg = args.lora_reg_weight * lora_regularization(unet)
-                loss_reward = args.reward_weight * reward_value
-                loss_reward_active = (
-                    loss_reward if rewardStatus else torch.zeros_like(loss_reward)
-                )
-                loss_reward_values_active = (
-                    reward_values if rewardStatus else torch.zeros_like(loss_reward)
-                )
-                if not rewardStatus:
-                    logger.info(
-                        f"Step {global_step}: 攻击成功, CLIP Score:   {clip_score.item():.4f}"
-                    )
-                #     loss = loss_reg + (1 - clip_score)
-                # else:
-                #     loss = loss_reward_active + loss_reg + loss_clip_score
-
-                # add clip gate
-                # clip_gate = 0.25
-                # temperature = 40
-                # soft_gate = torch.sigmoid(
-                #     temperature * (clip_score - clip_gate)
-                # ).detach()
-
-                loss_reward_active2, frac_below_margin = margin_detection_loss(
-                    # loss_reward_active,  # (V,) per-view tensor，现在派上用场
-                    loss_reward_values_active,  # (V,) per-view tensor，现在派上用场
-                    margin=0.1,
-                    loss_type="squared_hinge",
-                    # loss_type="softplus",
-                )
-
-                # reward_loss = args.reward_weight * torch.relu(reward_values - reward_margin).mean()
-                # reward_loss = soft_gate * loss_reward_active
-                reward_loss = loss_reward_active2 * args.reward_weight
-
-                # ------------------------------------------------------
-                # Trajectory anchor loss (§3.X 自然性锚定)
-                #   - 触发条件: 对抗 prompt (非中性) + 概率 traj_anchor_prob
-                #   - 时间步范围: [t_min, t_max]，远离 BPTT 窗口
-                #   - 单 prompt forward + LoRA-off forward (no_grad)
-                # ------------------------------------------------------
-                is_neutral_step = prompt_pool is not None and pool_sample.is_neutral
-                should_apply_traj_anchor = (
-                    args.traj_anchor_weight > 0
-                    and not is_neutral_step
-                    and random.random() < args.traj_anchor_prob
-                )
-                if should_apply_traj_anchor:
+                loss_traj = args.traj_anchor_weight * loss_traj_raw
+            else:
+                with torch.no_grad():
                     loss_traj_raw = trajectory_anchor_loss(
                         unwrap_model(accelerator, unet),
                         prompt_embeds,
@@ -1891,132 +2096,21 @@ def main(args):
                         t_min=args.traj_anchor_t_min,
                         t_max=args.traj_anchor_t_max,
                     )
-                    loss_traj = args.traj_anchor_weight * loss_traj_raw
-                else:
-                    with torch.no_grad():
-                        loss_traj_raw = trajectory_anchor_loss(
-                            unwrap_model(accelerator, unet),
-                            prompt_embeds,
-                            pooled_prompt_embeds,
-                            add_time_ids,
-                            args.resolution,
-                            accelerator.device,
-                            weight_dtype,
-                            t_min=args.traj_anchor_t_min,
-                            t_max=args.traj_anchor_t_max,
-                        )
-                    loss_traj = torch.zeros(
-                        (), device=accelerator.device, dtype=weight_dtype
-                    )
-
-                loss = reward_loss + loss_clip_score + loss_reg + loss_traj
-                # loss = loss_traj
-                # 清理无用的计算图部分，节省显存
-                if (
-                    not rewardStatus
-                    and args.clip_weight == 0
-                    and args.traj_anchor_weight == 0
-                    and args.lora_reg_weight == 0
-                ):
-                    global_step += 1
-                    logs = {
-                        "loss": loss.detach().item(),
-                        "loss_reward": reward_loss.detach().item(),
-                        "loss_reward_raw": loss_reward_active.detach().item(),
-                        "loss_reg": loss_reg.detach().item(),
-                        "loss_clip_score": loss_clip_score.detach().item(),
-                        "loss_traj": loss_traj.detach().item(),
-                        "loss_traj_raw": loss_traj_raw.detach().item(),
-                        "traj_on": float(should_apply_traj_anchor),
-                        "clip_score": clip_score.detach().item(),
-                        "reward": reward_value.detach().item(),
-                        "lr": lr_scheduler.get_last_lr()[0],
-                        "FracBelowMargin": frac_below_margin.detach().item(),
-                    }
-                    accelerator.log(logs, step=global_step)
-                    optimizer.zero_grad(set_to_none=True)
-                    del (
-                        loss_reward_active,
-                        loss_reward,
-                        reward_outputs,
-                        rendered,
-                        reward_value,
-                        reward_values,
-                        diffusion_images,
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        negative_prompt_embeds,
-                        negative_pooled_prompt_embeds,
-                        add_time_ids,
-                    )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue  # reward太小不更新了，节省计算
-                grad_norm_logs = {}
-                should_log_grad_norms = (
-                    args.grad_norm_logging_steps > 0
-                    and accelerator.sync_gradients
-                    and global_step % args.grad_norm_logging_steps == 0
+                loss_traj = torch.zeros(
+                    (), device=accelerator.device, dtype=weight_dtype
                 )
-                if should_log_grad_norms:
-                    reward_grad_norm = loss_lora_grad_norm(
-                        reward_loss, params_to_optimize, accelerator
-                    )
-                    clip_grad_norm = loss_lora_grad_norm(
-                        loss_clip_score, params_to_optimize, accelerator
-                    )
-                    reward_grad_norm_item = reward_grad_norm.detach().item()
-                    clip_grad_norm_item = clip_grad_norm.detach().item()
-                    grad_norm_logs = {
-                        "grad_norm_reward_lora": reward_grad_norm_item,
-                        "grad_norm_clip_lora": clip_grad_norm_item,
-                    }
-                # end clip gate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                # optimizer.zero_grad(set_to_none=False)
-                optimizer.zero_grad()
-                if accelerator.is_main_process and global_step % 1 == 0:
-                    reward_values_text = ", ".join(
-                        f"{value:.4f}"
-                        for value in reward_values.detach().cpu().tolist()
-                    )
-                    # reward_values_text = f"{reward_value.item():.4f}"
-                    logger.info(
-                        f"Step {global_step}: Loss={loss.detach().item():.4f}, "
-                        f"LossReward={reward_loss.detach().item():.4f}, "
-                        f"LossReward_raw={loss_reward_active.detach().item():.4f}, "
-                        f"LossReg={loss_reg.detach().item():.8f}, "
-                        f"LossClip={loss_clip_score.detach().item():.4f}, "
-                        f"LossTraj={loss_traj.detach().item():.8f}, "
-                        f"LossTraj_raw={loss_traj_raw.detach().item():.8f}, "
-                        f"TrajOn={int(should_apply_traj_anchor)}, "
-                        f"ClipScore={clip_score.detach().item():.4f}, "
-                        f"RewardMean={reward_value.detach().item():.4f}, "
-                        f"FracBelowMargin={frac_below_margin.detach().item():.3f}, "
-                        f"reward_values_text={reward_values_text}, "
-                        f"LR={lr_scheduler.get_last_lr()[0]:.6f}"
-                    )
-                    logger.info(
-                        f"Step {global_step}: Prompts: {prompts}, CLIP Score:   {clip_score.detach().item():.4f}"
-                    )
-                    if grad_norm_logs:
-                        logger.info(
-                            f"Step {global_step}: GradNormRewardLoRA={reward_grad_norm_item:.6e}, "
-                            f"GradNormClipLoRA={clip_grad_norm_item:.6e}, "
-                            f"GradNormRewardClipRatio={reward_grad_norm_item / (clip_grad_norm_item + 1e-12):.6e}"
-                        )
-                    if prompt_pool is not None and prompt_axes_log is not None:
-                        logger.info(
-                            f"Step {global_step}: axes={prompt_axes_log}, "
-                            f"neutral_so_far={neutral_count}"
-                        )
-            
-            if accelerator.sync_gradients:
+
+            loss = reward_loss + loss_clip_score + loss_reg + loss_traj
+            # loss = loss_traj
+            # 清理无用的计算图部分，节省显存
+            if (
+                not rewardStatus
+                and args.clip_weight == 0
+                and args.traj_anchor_weight == 0
+                and args.lora_reg_weight == 0
+            ):
                 global_step += 1
+                idx += 1
                 logs = {
                     "loss": loss.detach().item(),
                     "loss_reward": reward_loss.detach().item(),
@@ -2031,47 +2125,141 @@ def main(args):
                     "lr": lr_scheduler.get_last_lr()[0],
                     "FracBelowMargin": frac_below_margin.detach().item(),
                 }
-                logs.update(grad_norm_logs)
                 accelerator.log(logs, step=global_step)
-                if global_step >= args.max_train_steps:
-                    stop_training = True
-                    break
-                # 每 N次 梯度步保存一次 LoRA 权重检查点，并进行评估
-                if (
-                    accelerator.is_main_process
-                    and global_step % args.checkpointing_steps == 0
-                ):
-                    prune_checkpoints(args.output_dir, args.checkpoints_total_limit)
-                    checkpoint_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    unwrapped_unet = unwrap_model(accelerator, unet)
-                    # unwrapped_unet = unwrap_model(accelerator, unet).to(torch.float32)
-                    unet_lora_state_dict = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(unwrapped_unet)
-                    )
-                    StableDiffusionXLPipeline.save_lora_weights(
-                        save_directory=checkpoint_dir,
-                        unet_lora_layers=unet_lora_state_dict,
-                    )
+                optimizer.zero_grad(set_to_none=True)
+                del (
+                    loss_reward_active,
+                    loss_reward,
+                    reward_outputs,
+                    rendered,
+                    reward_value,
+                    reward_values,
+                    diffusion_images,
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    negative_prompt_embeds,
+                    negative_pooled_prompt_embeds,
+                    add_time_ids,
+                )
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                continue  # reward太小不更新了，节省计算
+            grad_norm_logs = {}
+            should_log_grad_norms = (
+                args.grad_norm_logging_steps > 0
+                and accelerator.sync_gradients
+                and global_step % args.grad_norm_logging_steps == 0
+            )
+            if should_log_grad_norms:
+                reward_grad_norm = loss_lora_grad_norm(
+                    reward_loss, params_to_optimize, accelerator
+                )
+                clip_grad_norm = loss_lora_grad_norm(
+                    loss_clip_score, params_to_optimize, accelerator
+                )
+                reward_grad_norm_item = reward_grad_norm.detach().item()
+                clip_grad_norm_item = clip_grad_norm.detach().item()
+                grad_norm_logs = {
+                    "grad_norm_reward_lora": reward_grad_norm_item,
+                    "grad_norm_clip_lora": clip_grad_norm_item,
+                }
+            # end clip gate
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            # optimizer.zero_grad(set_to_none=False)
+            optimizer.zero_grad()
+            if accelerator.is_main_process and global_step % 1 == 0:
+                reward_values_text = ", ".join(
+                    f"{value:.4f}" for value in reward_values.detach().cpu().tolist()
+                )
+                # reward_values_text = f"{reward_value.item():.4f}"
+                logger.info(
+                    f"Step {global_step}: Loss={loss.detach().item():.4f}, "
+                    f"LossReward={reward_loss.detach().item():.4f}, "
+                    f"LossReward_raw={loss_reward_active.detach().item():.4f}, "
+                    f"LossReg={loss_reg.detach().item():.8f}, "
+                    f"LossClip={loss_clip_score.detach().item():.4f}, "
+                    f"LossTraj={loss_traj.detach().item():.8f}, "
+                    f"LossTraj_raw={loss_traj_raw.detach().item():.8f}, "
+                    f"TrajOn={int(should_apply_traj_anchor)}, "
+                    f"ClipScore={clip_score.detach().item():.4f}, "
+                    f"RewardMean={reward_value.detach().item():.4f}, "
+                    f"FracBelowMargin={frac_below_margin.detach().item():.3f}, "
+                    f"reward_values_text={reward_values_text}, "
+                    f"LR={lr_scheduler.get_last_lr()[0]:.6f}"
+                )
+                logger.info(
+                    f"Step {global_step}: Prompts: {prompts}, CLIP Score:   {clip_score.detach().item():.4f}"
+                )
+                if grad_norm_logs:
+                    logger.info(
+                        f"Step {global_step}: GradNormRewardLoRA={reward_grad_norm_item:.6e}, "
+                        f"GradNormClipLoRA={clip_grad_norm_item:.6e}, "
+                        f"GradNormRewardClipRatio={reward_grad_norm_item / (clip_grad_norm_item + 1e-12):.6e}"
+                    )
+                if prompt_pool is not None and prompt_axes_log is not None:
+                    logger.info(
+                        f"Step {global_step}: axes={prompt_axes_log}, "
+                        f"neutral_so_far={neutral_count}"
+                    )
 
-                    # run_quick_asr_eval(
-                    #     global_step=global_step,
-                    #     checkpoint_dir=checkpoint_dir,
-                    #     args=args,
-                    #     accelerator=accelerator,
-                    #     tokenizer=tokenizer,
-                    #     text_encoder=text_encoder,
-                    #     vae=vae,
-                    #     unet=unwrapped_unet,
-                    #     base_scheduler=base_scheduler,
-                    #     weight_dtype=weight_dtype,
-                    #     texture_render_model=texture_render_model,
-                    #     yolo_model=yolo_reward_model,
-                    # )
-        if stop_training:
-            break
+        if accelerator.sync_gradients:
+            global_step += 1
+            idx += 1
+            logs = {
+                "loss": loss.detach().item(),
+                "loss_reward": reward_loss.detach().item(),
+                "loss_reward_raw": loss_reward_active.detach().item(),
+                "loss_reg": loss_reg.detach().item(),
+                "loss_clip_score": loss_clip_score.detach().item(),
+                "loss_traj": loss_traj.detach().item(),
+                "loss_traj_raw": loss_traj_raw.detach().item(),
+                "traj_on": float(should_apply_traj_anchor),
+                "clip_score": clip_score.detach().item(),
+                "reward": reward_value.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "FracBelowMargin": frac_below_margin.detach().item(),
+            }
+            logs.update(grad_norm_logs)
+            accelerator.log(logs, step=global_step)
+            if global_step >= args.max_train_steps:
+                break
+            # 每 N次 梯度步保存一次 LoRA 权重检查点，并进行评估
+            if (
+                accelerator.is_main_process
+                and global_step % args.checkpointing_steps == 0 and global_step>2000
+            ):
+                prune_checkpoints(args.output_dir, args.checkpoints_total_limit)
+                checkpoint_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped_unet = unwrap_model(accelerator, unet)
+                # unwrapped_unet = unwrap_model(accelerator, unet).to(torch.float32)
+                unet_lora_state_dict = convert_state_dict_to_diffusers(
+                    get_peft_model_state_dict(unwrapped_unet)
+                )
+                StableDiffusionXLPipeline.save_lora_weights(
+                    save_directory=checkpoint_dir,
+                    unet_lora_layers=unet_lora_state_dict,
+                )
+                torch.cuda.empty_cache()
 
+                # run_quick_asr_eval(
+                #     global_step=global_step,
+                #     checkpoint_dir=checkpoint_dir,
+                #     args=args,
+                #     accelerator=accelerator,
+                #     tokenizer=tokenizer,
+                #     text_encoder=text_encoder,
+                #     vae=vae,
+                #     unet=unwrapped_unet,
+                #     base_scheduler=base_scheduler,
+                #     weight_dtype=weight_dtype,
+                #     texture_render_model=texture_render_model,
+                #     yolo_model=yolo_reward_model,
+                # )
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         final_unet = unwrap_model(accelerator, unet).to(torch.float32)

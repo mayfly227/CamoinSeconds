@@ -14,6 +14,7 @@ class YoloRewardModel(torch.nn.Module):
             ) from exc
 
         self.yolo = YOLO(weight_path)
+        print(f"Loaded YOLO model from {weight_path}")
         self.model = self.yolo.eval()
 
         for parameter in self.model.model.parameters():
@@ -31,26 +32,23 @@ class YoloRewardModel(torch.nn.Module):
         self,
         images: torch.Tensor,
         mode: str = "non_targeted",
-        target_class_id: int = 0,
+        target_class_id: int = 2,
     ) -> tuple[bool, torch.Tensor]:
         """Compute differentiable confidence-based loss from YOLO raw predictions.
 
-        non_targeted: minimize sum of confidences over all classes.
-        targeted: minimize confidence for one target class.
+        non_targeted: minimize confidence for the selected class.
+        targeted: maximize confidence for the selected class by minimizing
+        the negative confidence.
         """
-        results_train = self.model(
-            images, verbose=False, conf=0.000001, iou=0.5, embed=[-1]
-        )
-        class_scores = results_train[0][:, 4:, :]
-
+        results_train = self.model(images, verbose=False, conf=0.01, iou=0.5, embed=[-1])
+        class_scores = results_train[0][:, 4 + target_class_id, :]
         if mode == "non_targeted":
-            loss = class_scores.sum()
+            kept_scores = class_scores[class_scores > 0.1]
+            if len(kept_scores) == 0:
+                return False, torch.FloatTensor([0.0]).to(device=images.device)
+            loss = kept_scores.mean()
         elif mode == "targeted":
-            if target_class_id < 0 or target_class_id >= class_scores.shape[1]:
-                raise ValueError(
-                    f"target_class_id out of range: {target_class_id}, valid [0, {class_scores.shape[1] - 1}]"
-                )
-            loss = class_scores[:, target_class_id, :].sum()
+            loss = -class_scores.amax(dim=1).mean()
         else:
             raise ValueError(
                 f"Unknown YOLO reward mode: {mode}. Expected 'non_targeted' or 'targeted'."
@@ -90,9 +88,9 @@ class YoloRewardModel(torch.nn.Module):
         mode: str = "non_targeted",
         target_class_id: int = 0,
     ) -> tuple[bool, torch.Tensor]:
-        return self.maxProExtract(
-            images,
-            [target_class_id])
+        # return self.maxProExtract(
+        #     images,
+        #     [target_class_id])
         return self.confidence_loss(
             images,
             mode=mode,
