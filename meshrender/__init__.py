@@ -17,8 +17,12 @@ from pytorch3d.renderer import (
     SoftPhongShader,
     TexturesUV,
 )
+from pytorch3d.transforms.transform3d import RotateAxisAngle
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+
+CARLA_MESH_YAW_FIX = 270.0
+CARLA_MESH_SCALE = 1.05
 
 
 def pil_to_tensor_rgb(path, device, image_size=None):
@@ -44,7 +48,15 @@ def tensor_rgb_to_pil(t):
     return Image.fromarray(arr)
 
 
-def build_renderer(device, image_size=1024, dist=5.0, elev=20.0, azim=150.0):
+def build_renderer(
+    device,
+    image_size=1024,
+    dist=5.0,
+    elev=20.0,
+    azim=150.0,
+    bin_size=0,
+    max_faces_per_bin=200000,
+):
     R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)
     cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
 
@@ -52,6 +64,8 @@ def build_renderer(device, image_size=1024, dist=5.0, elev=20.0, azim=150.0):
         image_size=image_size,
         blur_radius=0.0,
         faces_per_pixel=1,
+        bin_size=bin_size,
+        max_faces_per_bin=max_faces_per_bin,
     )
     lights = PointLights(device=device, location=[[0.0, 3.0, -3.0]])
 
@@ -215,8 +229,18 @@ class TextureModel(nn.Module):
 # Mesh Geometry（只管 OBJ + UV index）
 # =====================================
 class MeshGeometry:
-    def __init__(self, obj_path, device="cuda"):
+    def __init__(
+        self,
+        obj_path,
+        device="cuda",
+        use_carla_mesh_transform: bool = False,
+        mesh_yaw_fix: float = CARLA_MESH_YAW_FIX,
+        mesh_scale: float = CARLA_MESH_SCALE,
+    ):
         self.device = device
+        self.use_carla_mesh_transform = use_carla_mesh_transform
+        self.mesh_yaw_fix = mesh_yaw_fix
+        self.mesh_scale = mesh_scale
         self.load_obj(obj_path)
 
     def load_obj(self, obj_path):
@@ -230,6 +254,16 @@ class MeshGeometry:
         if aux.verts_uvs is None or faces.textures_idx is None:
             raise RuntimeError("OBJ lacks UV info")
 
+        if self.use_carla_mesh_transform:
+            center = (verts.max(0).values + verts.min(0).values) / 2.0
+            verts = (verts - center) * self.mesh_scale
+            rfix = RotateAxisAngle(
+                angle=self.mesh_yaw_fix,
+                axis="Y",
+                degrees=True,
+            ).get_matrix()[0, :3, :3].to(self.device)
+            verts = verts @ rfix
+
         self.verts = verts
         self.faces = faces
         self.aux = aux
@@ -242,14 +276,24 @@ class MeshGeometry:
 # Renderer Wrapper（核心）
 # =====================================
 class FlexibleRenderer(nn.Module):
-    def __init__(self, device, image_size=1024):
+    def __init__(
+        self,
+        device,
+        image_size=1024,
+        blur_radius=1e-6,
+        faces_per_pixel=5,
+        bin_size=None,
+        max_faces_per_bin=None,
+    ):
         super().__init__()
         self.device = device
 
         self.raster_settings = RasterizationSettings(
             image_size=image_size,
-            blur_radius=1e-6,
-            faces_per_pixel=5,
+            blur_radius=blur_radius,
+            faces_per_pixel=faces_per_pixel,
+            # bin_size=bin_size,
+            max_faces_per_bin=max_faces_per_bin,
         )
 
         self.lights = PointLights(device=device, location=[[0.0, 5.0, -3.0]])
@@ -259,7 +303,8 @@ class FlexibleRenderer(nn.Module):
         )
         self.renderer = MeshRenderer(
             rasterizer=MeshRasterizer(raster_settings=self.raster_settings),
-            shader=SoftPhongShader(device=device, lights=self.lights),
+            # shader=SoftPhongShader(device=device, lights=self.lights),
+            shader=SoftPhongShader(device=device),
         )
 
         self.geometry = None
@@ -296,16 +341,17 @@ class FlexibleRenderer(nn.Module):
 
         faces_uvs, verts_uvs = self.geometry.get_uv_info()
         tex_map = self.texture.get_map()
+        batch_size = tex_map.shape[0]
 
         textures = TexturesUV(
             maps=tex_map,
-            faces_uvs=faces_uvs[None],
-            verts_uvs=verts_uvs[None],
+            faces_uvs=faces_uvs[None].expand(batch_size, -1, -1).contiguous(),
+            verts_uvs=verts_uvs[None].expand(batch_size, -1, -1).contiguous(),
         )
 
         mesh = Meshes(
-            verts=[self.geometry.verts],
-            faces=[self.geometry.faces.verts_idx],
+            verts=[self.geometry.verts] * batch_size,
+            faces=[self.geometry.faces.verts_idx] * batch_size,
             textures=textures,
         )
         return mesh
@@ -368,12 +414,32 @@ class TextureRenderModel(torch.nn.Module):
         texture_image_size: int,
         background_fill_value: float,
         mesh_obj_path: str = "pytorch3d_Etron.obj",
-        bg2_path: str = "/home/dk/project/FastAdv/img_optim.png",
+        bg2_path: str = "/home/dk/project/FastAdv/carmodel/audi/img_optim.png",
+        raster_blur_radius: float = 1e-6,
+        raster_faces_per_pixel: int = 5,
+        raster_bin_size: int = 0,
+        raster_max_faces_per_bin: int = 200000,
+        use_carla_mesh_transform: bool = False,
+        mesh_yaw_fix: float = CARLA_MESH_YAW_FIX,
+        mesh_scale: float = CARLA_MESH_SCALE,
     ):
         super().__init__()
-        self.geo = MeshGeometry(mesh_obj_path, device=device)
+        self.geo = MeshGeometry(
+            mesh_obj_path,
+            device=device,
+            use_carla_mesh_transform=use_carla_mesh_transform,
+            mesh_yaw_fix=mesh_yaw_fix,
+            mesh_scale=mesh_scale,
+        )
         self.tex = TextureModel(device, trainable=False)
-        self.renderer = FlexibleRenderer(device, image_size=render_image_size)
+        self.renderer = FlexibleRenderer(
+            device,
+            image_size=render_image_size,
+            blur_radius=raster_blur_radius,
+            faces_per_pixel=raster_faces_per_pixel,
+            bin_size=raster_bin_size,
+            max_faces_per_bin=raster_max_faces_per_bin,
+        )
         self.device = device
         self.render_image_size = render_image_size  # ← 新增
         self.texture_image_size = texture_image_size
