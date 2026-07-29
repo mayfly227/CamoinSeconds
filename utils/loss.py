@@ -137,7 +137,8 @@ def trajectory_anchor_loss(
     latent_channels: int = 4,
     z_t: Optional[torch.Tensor] = None,
     timesteps: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    budget: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Trajectory anchor (epsilon-consistency) loss.
 
@@ -161,12 +162,25 @@ def trajectory_anchor_loss(
                               cover the structure-determining region for a
                               standard 1000-step schedule.
         latent_channels:      4 for SD/SDXL.
-        z_t, timesteps:       Optional pre-sampled latents/timesteps. If
-                              omitted, sampled here. Useful if the caller
-                              wants to share the same z_t across losses.
+        z_t, timesteps:       PREFERRED: pass a real intermediate latent x_t
+                              cached from the actual DDIM sampling loop plus
+                              its timestep (int or tensor) — this anchors the
+                              constraint ON the visited trajectory, where the
+                              off-manifold drift actually happens. If omitted,
+                              falls back to a fresh Gaussian z_t (legacy
+                              behavior), which only constrains the UNet on
+                              structureless noise inputs that real sampling
+                              never visits after t≈999.
+        budget:               eps-deviation budget δ (RMS units). 0 → legacy
+                              hard anchor (drive eps_on → eps_off, i.e. 允许 0
+                              扰动=不许攻击). >0 → hinge budget: 只惩罚 RMS
+                              偏离超过 δ 的部分，relu(dev-δ)²。允许"换姿势/换
+                              花样"(dev≤δ 免罚)，只禁止"改出类"(dev≫δ 才罚)。
+                              δ 越大越自由，越小越贴 base。
 
     Returns:
-        Scalar MSE between LoRA-on and LoRA-off epsilon predictions.
+        (loss, dev)：loss 是回传项（budget=0 时为 MSE，>0 时为 hinge），
+        dev 是本次 RMS 偏离量 sqrt(MSE)，detached，仅供日志/调 δ。
     """
     if t_min < 0 or t_max < t_min:
         raise ValueError(f"Invalid trajectory anchor t-range: [{t_min}, {t_max}].")
@@ -175,16 +189,24 @@ def trajectory_anchor_loss(
     latent_h = resolution // 8
     latent_w = resolution // 8
 
+    if timesteps is not None and not torch.is_tensor(timesteps):
+        # 允许直接传采样循环里记下的 python int timestep
+        timesteps = torch.full((B,), int(timesteps), device=device, dtype=torch.long)
     if timesteps is None:
         timesteps = torch.randint(
             t_min, t_max + 1, (B,), device=device, dtype=torch.long
         )
     if z_t is None:
+        # Fallback（旧行为）：凭空采纯高斯。注意：这只约束 UNet 在无结构噪声
+        # 输入上的行为，真实采样轨迹在 t<~950 后携带图像结构、早已离开该输入
+        # 分布，锚不住轨迹上的结构改写。优先传入缓存的真实 x_t。
         z_t = torch.randn(
             (B, latent_channels, latent_h, latent_w),
             device=device,
             dtype=weight_dtype,
         )
+    else:
+        z_t = z_t.detach().to(device=device, dtype=weight_dtype)
 
     added_cond = {
         "text_embeds": pooled_prompt_embeds,
@@ -211,4 +233,156 @@ def trajectory_anchor_loss(
                 added_cond_kwargs=added_cond,
             ).sample
 
-    return F.mse_loss(eps_on, eps_off)
+    mse = F.mse_loss(eps_on, eps_off)
+    dev = mse.detach().clamp_min(0.0).sqrt()  # RMS eps-deviation, for logging / δ tuning
+    if budget > 0.0:
+        # 带预算的软限幅：dev ≤ δ 时零罚（允许换姿势/花样），超出才平方 hinge。
+        over = (mse.clamp_min(0.0).sqrt() - budget).clamp_min(0.0)
+        return over.pow(2), dev
+    return mse, dev
+
+
+def soft_color_histogram(
+    images: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    bins: int = 32,
+    sigma: float = 0.05,
+) -> torch.Tensor:
+    """
+    Differentiable per-channel soft color histogram.
+
+    颜色分布是"空间无关"的统计量：像素怎么在空间上重排（=改结构/花纹）都
+    不改直方图，只有"用了哪些颜色、各占多少"变了才变。这正好实现"结构可
+    改、颜色分布要锁"。
+
+    Args:
+        images: (B, 3, H, W) in [0, 1].
+        mask:   UV mask, (H, W) / (1, H, W) / (1, 1, H, W). 只统计 mask 内像素
+                （车身纹理用到的区域）。None = 全图。会自动 resize 到图像分辨率。
+        bins:   每通道 bin 数。
+        sigma:  soft binning 高斯宽度（[0,1] 色值尺度）。略大于 bin 宽(1/bins)
+                使分配平滑可微。
+
+    Returns:
+        (B, 3, bins) 每通道归一化直方图（沿 bins 和为 1）。
+    """
+    if images.ndim != 4 or images.shape[1] != 3:
+        raise ValueError(f"`images` must be (B,3,H,W), got {tuple(images.shape)}")
+    B, C, H, W = images.shape
+    device, dtype = images.device, images.dtype
+
+    centers = torch.linspace(
+        0.5 / bins, 1.0 - 0.5 / bins, bins, device=device, dtype=dtype
+    )  # (bins,)
+
+    x = images.reshape(B, C, H * W, 1)  # (B,C,HW,1)
+    d = x - centers.reshape(1, 1, 1, bins)  # (B,C,HW,bins)
+    w = torch.exp(-0.5 * (d / sigma) ** 2)  # 高斯软分配
+    w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)  # partition of unity（每像素权重和=1）
+
+    if mask is not None:
+        m = mask
+        while m.ndim < 4:
+            m = m.unsqueeze(0)
+        m = m.to(device=device, dtype=dtype)
+        if m.shape[1] != 1:
+            m = m[:, :1]  # UV mask 各通道相同，取单通道
+        if m.shape[-2:] != (H, W):
+            m = F.interpolate(m, size=(H, W), mode="nearest")
+        m = m[:1].reshape(1, 1, H * W, 1)  # (1,1,HW,1) broadcast
+        w = w * m
+        denom = m.sum().clamp_min(1.0)
+        hist = w.sum(dim=2) / denom  # (B,C,bins)
+    else:
+        hist = w.mean(dim=2)  # (B,C,bins)
+
+    hist = hist / (hist.sum(dim=-1, keepdim=True) + 1e-8)
+    return hist
+
+
+def color_histogram_distance(
+    hist_a: torch.Tensor, hist_b: torch.Tensor
+) -> torch.Tensor:
+    """
+    Per-sample 1D Wasserstein(W1) distance between two per-channel color
+    histograms, averaged over channels.
+
+    用 W1（=|CDF 差|之和）而非 L2：颜色整体平移 Δ 时 W1 ≈ Δ（[0,1] 色值尺度），
+    对"小改颜色"的 budget 有直接物理含义；L2 对 bin 错位过敏、平移不可解释。
+
+    Args:
+        hist_a, hist_b: (B, C, bins) 归一化直方图。
+    Returns:
+        (B,) 每样本的颜色分布距离，尺度≈归一化色值的平移量。
+    """
+    cdf_a = torch.cumsum(hist_a, dim=-1)
+    cdf_b = torch.cumsum(hist_b, dim=-1)
+    w1 = (cdf_a - cdf_b).abs().mean(dim=-1)  # (B,C)
+    return w1.mean(dim=-1)  # (B,)
+
+
+def color_distribution_loss(
+    images: torch.Tensor,
+    base_hist: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    bins: int = 32,
+    sigma: float = 0.05,
+    budget: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    颜色分布 anchor（带预算）：约束 LoRA 纹理的颜色分布贴近其 base 纹理，
+    只锁颜色、放开结构。per-prompt 使用（base_hist 是该 prompt 的 base 纹理
+    直方图）。
+
+    Args:
+        images:    (B,3,H,W) in [0,1]，LoRA-on 纹理图。
+        base_hist: (B,3,bins) 该 prompt 的 base 纹理软直方图（detached 缓存）。
+        mask:      UV mask。
+        budget:    δ_color（W1 尺度，≈归一化色值平移量）。dev≤δ 免罚（允许小改
+                   颜色），超出才平方 hinge。0 → 硬匹配（不建议）。
+
+    Returns:
+        (loss, dev)：dev 是本次颜色分布距离（detached，供调 δ_color / 日志）。
+    """
+    on_hist = soft_color_histogram(images, mask, bins, sigma)
+    base_hist = base_hist.to(device=on_hist.device, dtype=on_hist.dtype).detach()
+    dev = color_histogram_distance(on_hist, base_hist)  # (B,)
+    dev_mean = dev.mean()
+    if budget > 0.0:
+        over = (dev - budget).clamp_min(0.0)
+        loss = over.pow(2).mean()
+    else:
+        loss = dev_mean
+    return loss, dev_mean.detach()
+
+
+def diversity_repulsion_loss(
+    cur_feat: torch.Tensor,
+    bank_feats: Optional[torch.Tensor],
+    margin: float = 0.6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    跨 prompt 多样性排斥（memory-bank 版）。
+
+    把当前纹理表征推离 memory bank 里【不同 prompt】的历史表征：相似度超过
+    margin（太像）才罚，hinge 有界排斥——不无限推远（无限推会毁攻击/自然），
+    只要求"不要太像"。
+
+    ⚠️ 与颜色 anchor 不同：结构/整体表征的排斥和攻击【直接对抗】（因为"卵石阵"
+    这类崩塌结构往往就是攻击最优）。margin/weight 要保守，盯着攻击别塌。
+
+    Args:
+        cur_feat:   (1, D) 当前纹理的归一化表征（有梯度）。
+        bank_feats: (M, D) memory bank 里【不同 prompt】的归一化表征（detached）。
+                    None 或 M=0 时返回 0（保持梯度连接，backward 安全）。
+        margin:     cosine 相似度阈值，sim>margin 才推。崩塌时 sim≈0.9+。
+    Returns:
+        (loss, max_sim)：max_sim 是与库中最相似项的相似度（detached，日志用，
+        越高=越像别的 prompt=越崩）。
+    """
+    if bank_feats is None or bank_feats.numel() == 0:
+        z = cur_feat.sum() * 0.0
+        return z, z.detach()
+    sim = (cur_feat * bank_feats).sum(dim=-1)  # (M,) cosine（均已归一化）
+    rep = F.relu(sim - margin)
+    return rep.mean(), sim.max().detach()

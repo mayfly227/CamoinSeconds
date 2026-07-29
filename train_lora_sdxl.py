@@ -1,12 +1,20 @@
 import os
 from datetime import datetime
 
-from data.bgdataset import get_background_dataloader
-from utils import get_prompts_by_speed
-from utils.core import get_free_gpu, load_uv_mask, pil_from_tensor
-from utils.loss import lora_regularization
-from utils.validation import TestASR, TestASRQuick
-from utils.aug import ROA
+from data.dataset import build_cameras
+from prompt_pool import PromptPool
+from prompt_poolcodex import PromptPool as PromptPoolCodex
+from utils.aug import ROA, ROADiffusionImage
+from utils.core import get_free_gpu, load_uv_mask
+from utils.loss import (
+    color_distribution_loss,
+    disable_lora_context,
+    diversity_repulsion_loss,
+    lora_regularization,
+    margin_detection_loss,
+    soft_color_histogram,
+    trajectory_anchor_loss,
+)
 
 try:
     get_free_gpu()
@@ -15,89 +23,44 @@ except Exception as e:
         f"Warning: get_free_gpu() failed with error: {e}. Proceeding without setting CUDA_VISIBLE_DEVICES."
     )
     exit(0)
-# if len(sys.argv) > 1:
-#     print("传了命令行参数")
-#     if len(sys.argv) < 2:
-#         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-#     print("参数列表:", sys.argv[1:])  # 排除脚本名本身
-#     os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# else:
-#     print("没有传任何命令行参数")
-#     os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import argparse
 import logging
-import os
 import random
 import shutil
+from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-from transformers import CLIPModel, CLIPProcessor
-
-from meshrender import TextureRenderModel, tensor_rgb_to_pil
-from utils.cliputil import clip_text_image_similarity
-from utils.yolo import YoloRewardModel
-
-try:
-    import torch
-    import torch.nn.functional as F
-    import torchvision.transforms.functional as TF
-except ImportError as exc:
-    raise ImportError(
-        "PyTorch is required for `train_reward_lora_yolo.py`. Install `torch` first."
-    ) from exc
-
-try:
-    import transformers
-    from transformers import AutoTokenizer, PretrainedConfig
-except ImportError as exc:
-    raise ImportError(
-        "Transformers is required for `train_reward_lora_yolo.py`. Install `transformers` first."
-    ) from exc
-
-try:
-    import diffusers
-    from diffusers import (
-        AutoencoderKL,  # pyright: ignore[reportPrivateImportUsage]
-        DDIMScheduler,  # pyright: ignore[reportPrivateImportUsage]
-        DDPMScheduler,  # pyright: ignore[reportPrivateImportUsage]
-        DPMSolverMultistepScheduler,  # pyright: ignore[reportPrivateImportUsage]
-        StableDiffusionXLPipeline,  # pyright: ignore[reportPrivateImportUsage]
-        UNet2DConditionModel,  # pyright: ignore[reportPrivateImportUsage]
-    )
-    from diffusers.optimization import get_scheduler
-    from diffusers.training_utils import cast_training_params, free_memory
-    from diffusers.utils import (
-        check_min_version,
-        convert_state_dict_to_diffusers,  # pyright: ignore[reportPrivateImportUsage]
-        is_wandb_available,  # pyright: ignore[reportPrivateImportUsage]
-    )
-    from diffusers.utils.import_utils import is_xformers_available
-    from diffusers.utils.torch_utils import is_compiled_module
-except ImportError as exc:
-    raise ImportError(
-        "Diffusers is required for `train_reward_lora_yolo.py`. Install `diffusers` first."
-    ) from exc
-
-try:
-    from pytorch3d.renderer import TexturesUV, camera_position_from_spherical_angles
-except ImportError as exc:
-    raise ImportError(
-        "PyTorch3D and the local `meshrender` helpers are required for this script."
-    ) from exc
-
+import diffusers
+import torch
+import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from packaging import version
+from diffusers import (
+    AutoencoderKL,  # pyright: ignore[reportPrivateImportUsage]
+    DDIMScheduler,  # pyright: ignore[reportPrivateImportUsage]
+    DDPMScheduler,  # pyright: ignore[reportPrivateImportUsage]
+    DPMSolverMultistepScheduler,  # pyright: ignore[reportPrivateImportUsage]
+    StableDiffusionXLPipeline,  # pyright: ignore[reportPrivateImportUsage]
+    UNet2DConditionModel,  # pyright: ignore[reportPrivateImportUsage]
+)
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import cast_training_params, free_memory
+from diffusers.utils import (
+    check_min_version,
+    convert_state_dict_to_diffusers,  # pyright: ignore[reportPrivateImportUsage]
+)
+from diffusers.utils.torch_utils import is_compiled_module
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
+from transformers import AutoTokenizer, CLIPModel, CLIPProcessor, PretrainedConfig
 
-if is_wandb_available():
-    import wandb
-
+from meshrender import TextureRenderModel, tensor_rgb_to_pil
+from utils.cliputil import clip_image_feature, clip_text_image_similarity
 
 check_min_version("0.37")
 logger = get_logger(__name__)
@@ -110,8 +73,6 @@ LORA_TARGET_LEAF_MODULES = (
     "add_k_proj",
     "add_v_proj",
 )
-
-DEFAULT_LIGHT_LOCATION = (0.0, 5.0, -3.0)
 
 
 def import_model_class_from_model_name_or_path(
@@ -188,6 +149,11 @@ def parse_args():
         type=str,
         default="/mnt/data/dk/hf/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b",
     )
+    parser.add_argument(
+        "--clip_path",
+        type=str,
+        default="/mnt/data/dk/hf/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41",
+    )
     # 模型版本号或分支名
     parser.add_argument("--revision", type=str, default=None)
     # 模型权重变体，例如 fp16
@@ -195,7 +161,7 @@ def parse_args():
     # 单独指定 tokenizer 路径
     parser.add_argument("--tokenizer_name", type=str, default=None)
     # 训练输出目录
-    parser.add_argument("--output_dir", type=str, default="rewardyolo")
+    parser.add_argument("--output_dir", type=str, default="rewardyolosdxl")
     # 日志子目录
     parser.add_argument("--logging_dir", type=str, default="logs")
     # 随机种子
@@ -206,18 +172,36 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"]
     )
-    # 是否启用 TF32 加速
-    parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--use_margin_loss", action="store_true")
+    parser.add_argument(
+        "--margin",
+        type=float,
+        default=0.1,
+        help="Detection confidence margin used by --use_margin_loss.",
+    )
     # 梯度累积步数
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     # 是否启用梯度检查点节省显存
-    parser.add_argument("--gradient_checkpointing", default=False, type=bool)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--use_old_data", action="store_true")
+    parser.add_argument("--use_old_anchor", action="store_true")
     # 是否启用 xFormers 高效注意力
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", type=bool, default=False
     )
+    parser.add_argument(
+        "--nvdiffrast_texture_filter",
+        type=str,
+        default="linear-mipmap-linear",
+        choices=["nearest", "linear", "linear-mipmap-nearest", "linear-mipmap-linear"],
+        help=(
+            "nvdiffrast texture filtering mode. Mipmap modes use UV derivatives "
+            "so each screen pixel propagates gradients to a wider UV footprint."
+        ),
+    )
     # LoRA 秩
     parser.add_argument("--rank", type=int, default=64)
+    # parser.add_argument("--rank_alpha", type=int, default=64)
     # LoRA dropout 概率
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     # LoRA 注入范围
@@ -228,20 +212,90 @@ def parse_args():
         choices=["attn1", "attn2", "both"],
         help="Choose whether LoRA is injected into self-attention, cross-attention, or both.",
     )
-    #
+    parser.add_argument(
+        "--lora_last_steps",
+        "--lora_last_t",
+        dest="lora_last_steps",
+        type=int,
+        default=None,
+        help=(
+            "Only enable LoRA during the final N denoising steps. "
+            "Default keeps LoRA active for all denoising steps. "
+            "Example: --lora_last_steps 4 with --num_inference_steps 20."
+        ),
+    )
     parser.add_argument("--clip_weight", type=float, default=0.2)
+    # masked-CLIP：CLIP 只对 UV mask 内计分（mask 外填中性灰）。
+    # 动机：reward 梯度支撑只在 mask 内（只有这些 texel 会被渲染上车），
+    # 全图 CLIP 会被优化器"外包"到 mask 外 71% 的免费面积上，
+    # 导致上车区域 prompt 忠实度为零（实测 mask 外 +0.018 / mask 内 -0.013）。
+    parser.add_argument(
+        "--clip_uv_masked",
+        action="store_true",
+        help="Compute the CLIP objective on the UV-masked texture (outside region "
+        "filled with `clip_mask_fill`) so prompt-consistency is scored only on "
+        "texels that actually get rendered onto the car.",
+    )
+    parser.add_argument(
+        "--clip_mask_fill",
+        type=float,
+        default=0.5,
+        help="Fill value outside the UV mask when --clip_uv_masked is on. "
+        "Neutral gray 0.5 preserves CLIP's pattern discrimination best.",
+    )
     # 学习率
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    # AdamW 的 beta1
-    parser.add_argument("--adam_beta1", type=float, default=0.9)
-    # AdamW 的 beta2
-    parser.add_argument("--adam_beta2", type=float, default=0.999)
-    # AdamW 权重衰减
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
-    # AdamW 数值稳定项
-    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     # 梯度裁剪上限
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    # 每隔多少个优化步记录一次各 loss 对 LoRA 参数的梯度范数；<=0 表示关闭
+    parser.add_argument("--grad_norm_logging_steps", type=int, default=0)
+    # 颜色分布 anchor（软直方图）：只锁颜色分布、放开结构。per-prompt 锚 base 纹理。
+    parser.add_argument(
+        "--color_weight",
+        type=float,
+        default=0.0,
+        help="颜色分布 anchor 权重（0=关）。约束 LoRA 纹理颜色分布贴近 base。",
+    )
+    parser.add_argument(
+        "--color_budget",
+        type=float,
+        default=0.0,
+        help="δ_color（W1 尺度≈归一化色值平移量）。dev≤δ 免罚（允许小改颜色），"
+        "超出才罚。0=硬匹配。建议 0.05~0.15。",
+    )
+    parser.add_argument("--color_hist_bins", type=int, default=32)
+    parser.add_argument(
+        "--color_hist_sigma",
+        type=float,
+        default=0.05,
+        help="软直方图高斯分配宽度（[0,1] 色值尺度）。",
+    )
+    # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
+    # CLIP-image 表征。默认关(weight=0)，关时完全不算 CLIP-image forward、零开销。
+    # ⚠️ 与攻击直接对抗(崩塌结构常是攻击最优)，margin/weight 要保守。
+    parser.add_argument(
+        "--diversity_weight",
+        type=float,
+        default=0.0,
+        help="多样性排斥权重(0=关，关时零开销)。",
+    )
+    parser.add_argument(
+        "--diversity_margin",
+        type=float,
+        default=0.6,
+        help="cosine 相似度阈值，sim>margin(太像)才推。崩塌时 sim≈0.9+。",
+    )
+    parser.add_argument("--diversity_bank_size", type=int, default=64)
+    parser.add_argument(
+        "--init_lora_path",
+        type=str,
+        default=None,
+        help=(
+            "可选：从已保存的 LoRA checkpoint 目录热启动（含 "
+            "pytorch_lora_weights.safetensors）。诊断用途：在已崩塌的 "
+            "checkpoint 上继续训练/测梯度冲突。"
+        ),
+    )
     # 学习率调度器类型
     parser.add_argument("--lr_scheduler", type=str, default="constant")
     # 学习率预热步数
@@ -253,7 +307,7 @@ def parse_args():
     # 总训练步数
     parser.add_argument("--max_train_steps", type=int, default=1000)
     # 每隔多少步保存 checkpoint
-    parser.add_argument("--checkpointing_steps", type=int, default=50)
+    parser.add_argument("--checkpointing_steps", type=int, default=100)
     # 最多保留多少个 checkpoint
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     # 每隔多少步做一次验证
@@ -265,9 +319,9 @@ def parse_args():
     # 扩散采样步数
     parser.add_argument("--num_inference_steps", type=int, default=20)
     # CFG 引导系数
-    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
     # 扩散生成分辨率
-    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--resolution", type=int, default=640)
     # 渲染图像分辨率
     parser.add_argument("--render_image_size", type=int, default=640)
     # UV 纹理图分辨率
@@ -276,24 +330,17 @@ def parse_args():
     parser.add_argument("--tokenizer_max_length", type=int, default=None)
     # 文本编码时是否传 attention mask
     parser.add_argument("--text_encoder_use_attention_mask", action="store_true")
-    # 触发词
-    parser.add_argument("--trigger_token", type=str, default="TQL")
-    # 目标类别名称
-    parser.add_argument("--target_class_name", type=str, default="Camouflage texture")
     # 目标类别 ID
     parser.add_argument("--target_class_id", type=int, default=None)
     # YOLO 奖励模型路径
-    parser.add_argument("--reward_model_path", type=str, default="yolomodel/yolo12m.pt")
+    parser.add_argument("--reward_model_path", type=str, default="yolomodel/yolov3u.pt")
+    parser.add_argument("--reward_mode", type=str, default="non_targeted")
     # reward 项的损失权重
     parser.add_argument("--reward_weight", type=float, default=1.0)
     # LoRA 正则项权重
     parser.add_argument("--lora_reg_weight", type=float, default=1e-4)
     # 负面提示词
     parser.add_argument("--negative_prompt", type=str, default="")
-    # prompt 模板文件路径
-    parser.add_argument("--prompt_templates_file", type=str, default=None)
-    # 验证时使用的 prompt 列表
-    parser.add_argument("--eval_prompts", nargs="*", default=None)
     # 训练提示词采样范围，如: --prompt bio:0.2 arc:0.2 或 --prompt all:0.2
     parser.add_argument(
         "--prompt",
@@ -304,55 +351,88 @@ def parse_args():
             "'--prompt all:0.2'. Ratio must be in [0, 1]."
         ),
     )
+    # ----- 多轴 prompt pool 配置（对应论文 §3.2） -----
+    # 是否启用多轴组合 prompt 池；False 时退回旧的 ALL_PROMPTS 路径
+    parser.add_argument("--use_prompt_pool", action="store_true")
+    parser.add_argument("--use_prompt_pool_codex", action="store_true")
+    # 中性锚点 prompt 出现概率（prior preservation 替代项）
+    parser.add_argument("--prompt_p_neutral", type=float, default=0.10)
+    # prompt pool 划分种子（控制 train/comp/ood 划分，复现关键）
+    parser.add_argument("--prompt_pool_seed", type=int, default=42)
+    # 每个轴预留多少值作 OOD 测试集
+    parser.add_argument("--prompt_holdout_per_axis", type=int, default=2)
+    # 预留多少个 (material, context) 对作组合泛化测试集
+    parser.add_argument("--prompt_holdout_combos", type=int, default=8)
     # 渲染所用 OBJ 模型路径
-    parser.add_argument("--mesh_obj_path", type=str, default="pytorch3d_Etron.obj")
+    parser.add_argument(
+        "--mesh_obj_path", type=str, default="carmodel/audi/pytorch3d_Etron.obj"
+    )
+    parser.add_argument(
+        "--use_carla_mesh_transform",
+        action="store_true",
+        help="Use CARLA-aligned mesh centering, scaling, and yaw rotation.",
+    )
     # UV 掩码图片路径
-    parser.add_argument("--uv_mask_path", type=str, default="img_optim.png")
+    parser.add_argument(
+        "--uv_mask_path", type=str, default="carmodel/audi/modified_mask.png"
+    )
     # UV 掩码外区域的填充值
     parser.add_argument("--background_fill_value", type=float, default=0.0)
-    # 多视角 reward 渲染时，每个视角使用不同背景
-    parser.add_argument("--different_view_backgrounds", action="store_true")
-    # 相机采样策略
     parser.add_argument(
-        "--camera_sampler",
-        type=str,
-        default="legacy",
-        choices=["legacy", "stratified"],
+        "--bptt",
+        type=int,
+        nargs="+",
+        default=[18],
+        help=(
+            "Candidate truncation step indices for BPTT. One value is sampled "
+            "each denoising run; e.g. '--bptt 15 16' with 20 inference steps "
+            "updates the last 5 or 4 denoising steps."
+        ),
     )
-    # 方位角分桶数量
-    parser.add_argument("--camera_azimuth_bins", type=int, default=12)
-    # 方位角桶内抖动范围
-    parser.add_argument("--camera_azimuth_jitter", type=float, default=10.0)
-    # 相机俯仰角最小值
-    parser.add_argument("--camera_elevation_min", type=float, default=-5.0)
-    # 相机俯仰角最大值
-    parser.add_argument("--camera_elevation_max", type=float, default=25.0)
-    # 相机俯仰角采样峰值
-    parser.add_argument("--camera_elevation_mode", type=float, default=10.0)
-    # 相机距离最小值
-    parser.add_argument("--camera_distance_min", type=float, default=7.0)
-    # 相机距离最大值
-    parser.add_argument("--camera_distance_max", type=float, default=9.5)
-    # 相机距离采样峰值
-    parser.add_argument("--camera_distance_mode", type=float, default=8.0)
-    # 是否启用灯光随机化
-    parser.add_argument("--randomize_lighting", action="store_true")
-    # 灯光方位角最小值
-    parser.add_argument("--light_azimuth_min", type=float, default=0.0)
-    # 灯光方位角最大值
-    parser.add_argument("--light_azimuth_max", type=float, default=360.0)
-    # 灯光俯仰角最小值
-    parser.add_argument("--light_elevation_min", type=float, default=20.0)
-    # 灯光俯仰角最大值
-    parser.add_argument("--light_elevation_max", type=float, default=75.0)
-    # 灯光俯仰角采样峰值
-    parser.add_argument("--light_elevation_mode", type=float, default=45.0)
-    # 灯光距离最小值
-    parser.add_argument("--light_distance_min", type=float, default=4.5)
-    # 灯光距离最大值
-    parser.add_argument("--light_distance_max", type=float, default=7.0)
-    # 灯光距离采样峰值
-    parser.add_argument("--light_distance_mode", type=float, default=5.5)
+
+    parser.add_argument("--use_diffusion_image_aug", action="store_true")
+    parser.add_argument("--use_roa", action="store_true")
+    parser.add_argument("--ddim_eta", default=0.0, type=float)
+    parser.add_argument("--renderer_backend", default="pytorch3d", type=str)
+
+    parser.add_argument(
+        "--traj_anchor_weight",
+        type=float,
+        default=0.0,
+        help="Weight for trajectory anchor loss (epsilon consistency). 0 disables.",
+    )
+    parser.add_argument(
+        "--traj_anchor_t_min",
+        type=int,
+        default=400,
+        help="Lower bound (inclusive) of timestep range for trajectory anchor. "
+        "Should sit comfortably above the BPTT window so structure-step anchoring "
+        "does not collide with texture-step adversarial backprop.",
+    )
+    parser.add_argument(
+        "--traj_anchor_t_max",
+        type=int,
+        default=999,
+        help="Upper bound (inclusive) of timestep range for trajectory anchor.",
+    )
+    parser.add_argument(
+        "--traj_anchor_prob",
+        type=float,
+        default=1.0,
+        help="Probability of applying the trajectory anchor at each adversarial step. "
+        "Lower this (e.g. 0.5) to amortize the extra UNet forward+backward across steps.",
+    )
+    parser.add_argument(
+        "--traj_anchor_budget",
+        type=float,
+        default=0.0,
+        help="eps-deviation budget δ (RMS units) for the trajectory anchor. "
+        "0 → hard anchor (drive eps_on→eps_off, 0 扰动=不许攻击). "
+        ">0 → soft budget: 只惩罚 RMS 偏离超过 δ 的部分 (relu(dev-δ)²)，"
+        "允许在 base 轨迹周围换姿势/花样、只禁止改出类。δ 是攻击强度↔类内保真的旋钮。"
+        "配合门控时锚点自动落在 LoRA 激活的门控窗口 (t 见 --lora_last_steps)。",
+    )
+
     args = parser.parse_args()
 
     if args.reward_batch_size != 1:
@@ -365,42 +445,26 @@ def parse_args():
         raise ValueError("`max_train_steps` must be positive.")
     if args.num_inference_steps < 1:
         raise ValueError("`num_inference_steps` must be positive.")
+    if args.lora_last_steps is not None and (
+        args.lora_last_steps < 1 or args.lora_last_steps > args.num_inference_steps
+    ):
+        raise ValueError(
+            "`lora_last_steps` must be in [1, num_inference_steps], "
+            f"got {args.lora_last_steps} for num_inference_steps={args.num_inference_steps}."
+        )
+    if not args.bptt:
+        raise ValueError("`bptt` must contain at least one truncation step.")
+    for bptt_step in args.bptt:
+        if bptt_step < 0 or bptt_step >= args.num_inference_steps:
+            raise ValueError(
+                "`bptt` values must be in [0, num_inference_steps - 1], "
+                f"got {bptt_step} for num_inference_steps={args.num_inference_steps}."
+            )
     if args.resolution % 8 != 0:
         raise ValueError("`resolution` must be divisible by 8 for SDXL latent scaling.")
     if not 0.0 <= args.background_fill_value <= 1.0:
         raise ValueError("`background_fill_value` must be in [0, 1].")
-    if args.camera_azimuth_bins < 1:
-        raise ValueError("`camera_azimuth_bins` must be at least 1.")
-    if args.camera_azimuth_jitter < 0.0:
-        raise ValueError("`camera_azimuth_jitter` must be non-negative.")
-    validate_triangular_range(
-        "camera_elevation",
-        args.camera_elevation_min,
-        args.camera_elevation_max,
-        args.camera_elevation_mode,
-    )
-    validate_triangular_range(
-        "camera_distance",
-        args.camera_distance_min,
-        args.camera_distance_max,
-        args.camera_distance_mode,
-    )
-    validate_triangular_range(
-        "light_elevation",
-        args.light_elevation_min,
-        args.light_elevation_max,
-        args.light_elevation_mode,
-    )
-    validate_triangular_range(
-        "light_distance",
-        args.light_distance_min,
-        args.light_distance_max,
-        args.light_distance_mode,
-    )
-    if args.light_azimuth_max <= args.light_azimuth_min:
-        raise ValueError(
-            "`light_azimuth_max` must be greater than `light_azimuth_min`."
-        )
+
     return args
 
 
@@ -424,108 +488,19 @@ def validate_triangular_range(name: str, low: float, high: float, mode: float) -
         )
 
 
-def sample_triangular(low: float, high: float, mode: float) -> float:
-    if high == low:
-        return low
-    return random.triangular(low, high, mode)
+def cycle_dataloader(dataloader):
+    while True:
+        for batch in dataloader:
+            yield batch
 
 
-class RenderSamplingState:
-    def __init__(self, args, device):
-        self.args = args
-        self.device = device
-        self._azimuth_order: List[int] = []
-        self._azimuth_index = 0
-
-    def _next_azimuth_bin(self) -> int:
-        if self._azimuth_index >= len(self._azimuth_order):
-            self._azimuth_order = list(range(self.args.camera_azimuth_bins))
-            random.shuffle(self._azimuth_order)
-            self._azimuth_index = 0
-        bin_index = self._azimuth_order[self._azimuth_index]
-        self._azimuth_index += 1
-        return bin_index
-
-    def sample_camera(self):
-        if self.args.camera_sampler == "legacy":
-            elev = random.choice([0.0, 10.0, 20.0])
-            azim = random.choice(list(range(0, 360, 10)))
-            # dist = random.uniform(7.0, 12.0)
-            dist = random.choice([7.0, 8.0, 9.0, 10.0])
-            return dist, elev, azim
-        # raise NotImplementedError(f"Unsupported camera sampler: {self.args.camera_sampler}")
-        bin_index = self._next_azimuth_bin()
-        bin_width = 360.0 / self.args.camera_azimuth_bins
-        bin_center = (bin_index + 0.5) * bin_width
-        max_jitter = bin_width / 2.0
-        jitter = min(self.args.camera_azimuth_jitter, max_jitter)
-        azim = (bin_center + random.uniform(-jitter, jitter)) % 360.0
-        elev = sample_triangular(
-            self.args.camera_elevation_min,
-            self.args.camera_elevation_max,
-            self.args.camera_elevation_mode,
-        )
-        dist = sample_triangular(
-            self.args.camera_distance_min,
-            self.args.camera_distance_max,
-            self.args.camera_distance_mode,
-        )
-        return dist, elev, azim
-
-    def sample_light_location(self) -> torch.Tensor:
-        dist = sample_triangular(
-            self.args.light_distance_min,
-            self.args.light_distance_max,
-            self.args.light_distance_mode,
-        )
-        elev = sample_triangular(
-            self.args.light_elevation_min,
-            self.args.light_elevation_max,
-            self.args.light_elevation_mode,
-        )
-        azim = random.uniform(self.args.light_azimuth_min, self.args.light_azimuth_max)
-        return camera_position_from_spherical_angles(
-            distance=dist,
-            elevation=elev,
-            azimuth=azim,
-            degrees=True,
-            device=self.device,
-        )
-
-
-def select_view_background(background, view_index: int, num_views: int, enabled: bool):
-    if not enabled:
-        return background
-    if not isinstance(background, torch.Tensor):
-        raise TypeError(
-            "`different_view_backgrounds` requires a tensor background batch."
-        )
-    if background.ndim == 3:
-        if num_views != 1:
-            raise ValueError(
-                "`different_view_backgrounds` needs one background per view."
-            )
-        return background
-    if background.ndim != 4:
-        raise ValueError(
-            f"background tensor must be 3-D or 4-D, got {background.ndim}-D"
-        )
-    if background.shape[0] < num_views:
-        raise ValueError(
-            f"background batch size {background.shape[0]} is smaller than num_views {num_views}."
-        )
-    return background[view_index : view_index + 1]
-
-
-def render_reward_multi_view(
+def render_reward_multi_view_carla(
     texture_render_model,
-    render_sampling_state: RenderSamplingState,
     yolo_reward_model,
     diffusion_images: torch.Tensor,
-    background,
+    carla_batch,
+    carla_dataset,
     num_views: int,
-    randomize_lighting: bool,
-    different_view_backgrounds: bool = False,
     reward_mode: str = "non_targeted",
     target_class_id: int = 2,
     roa=None,
@@ -535,17 +510,21 @@ def render_reward_multi_view(
     reward_statuses = []
     view_cameras = []
 
-    for view_index in range(num_views):
-        dist, elev, azim = render_sampling_state.sample_camera()
-        view_cameras.append((dist, elev, azim))
-        cam = texture_render_model.get_camera(dist=dist, elev=elev, azim=azim)
-        if randomize_lighting:
-            texture_render_model.set_light_location(
-                render_sampling_state.sample_light_location()
-            )
-        view_background = select_view_background(
-            background, view_index, num_views, different_view_backgrounds
+    device = diffusion_images.device
+    carla_images = carla_batch["image"].to(device)
+    batch_size = carla_images.shape[0]
+    views_to_render = min(num_views, batch_size)
+    if views_to_render < 1:
+        raise ValueError("CARLA batch is empty; cannot render reward views.")
+
+    for view_index in range(views_to_render):
+        cam = build_cameras(
+            carla_batch["R"][view_index : view_index + 1],
+            carla_batch["T"][view_index : view_index + 1],
+            carla_dataset,
+            device=device,
         )
+        view_background = carla_images[view_index : view_index + 1]
         rendered = texture_render_model(cam, diffusion_images, view_background)
         rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
         if roa is not None:
@@ -596,9 +575,55 @@ def build_optimizer(args, params: Iterable[torch.nn.Parameter]):
     return torch.optim.AdamW(
         params,
         lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+    )
+
+
+def loss_lora_grad_norm(
+    loss: torch.Tensor,
+    params: Sequence[torch.nn.Parameter],
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    device = loss.device if loss.is_cuda else accelerator.device
+    total_sq = torch.zeros((), device=device, dtype=torch.float32)
+    if not loss.requires_grad:
+        return total_sq
+
+    grads = torch.autograd.grad(
+        loss,
+        [param for param in params if param.requires_grad],
+        retain_graph=True,
+        allow_unused=True,
+    )
+    for grad in grads:
+        if grad is None:
+            continue
+        total_sq = total_sq + grad.detach().float().pow(2).sum()
+
+    if accelerator.num_processes > 1:
+        total_sq = accelerator.reduce(total_sq, reduction="sum")
+    return total_sq.sqrt()
+
+
+def loss_lora_grad_flat(
+    loss: torch.Tensor,
+    params: Sequence[torch.nn.Parameter],
+) -> Optional[torch.Tensor]:
+    """
+    单个损失对 LoRA 参数的完整梯度，展平成一个 fp32 向量（detached）。
+
+    用于两两余弦相似度诊断：cos<0 = 方向冲突（PCGrad 的适用域），
+    cos≈0 但范数差几个数量级 = 量级失衡（该归一化/GradNorm，PCGrad 无效）。
+    注意：单进程语义（多卡下各 rank 只看到本地梯度）。
+    """
+    if not loss.requires_grad:
+        return None
+    req = [p for p in params if p.requires_grad]
+    grads = torch.autograd.grad(loss, req, retain_graph=True, allow_unused=True)
+    return torch.cat(
+        [
+            (g if g is not None else torch.zeros_like(p)).detach().float().reshape(-1)
+            for g, p in zip(grads, req)
+        ]
     )
 
 
@@ -607,14 +632,13 @@ def unwrap_model(accelerator: Accelerator, model):
     return model._orig_mod if is_compiled_module(model) else model
 
 
+def get_adapter_state_model(model):
+    model = getattr(model, "module", model)
+    return model._orig_mod if is_compiled_module(model) else model
+
+
 def prepare_scheduler_ddim(base_scheduler, num_inference_steps: int):
     scheduler = DDIMScheduler.from_config(base_scheduler.config)
-    scheduler.set_timesteps(num_inference_steps)
-    return scheduler
-
-
-def prepare_scheduler_dpm(base_scheduler, num_inference_steps: int):
-    scheduler = DPMSolverMultistepScheduler()
     scheduler.set_timesteps(num_inference_steps)
     return scheduler
 
@@ -713,16 +737,22 @@ def sample_latents_with_grad(
     guidance_scale: float,
     truncated_backprop_rand: bool = True,
     truncated_backprop_minmax: tuple = (0, 50),
+    args=None,
+    disable_lora_all: bool = False,
 ):
     """
-    执行 DDIM 采样，并在随机截断点 K 之后保留梯度计算图。
+    执行 DDIM 采样，并在截断点 K 之后保留梯度计算图。
 
-    - timestep > K（早期去噪步）：stop_gradient，不参与反向传播
-    - timestep <= K（后期去噪步）：保留计算图，梯度可以流过
+    - step_idx < K（早期去噪步）：stop_gradient，不参与反向传播
+    - step_idx >= K（后期去噪步）：保留计算图，梯度可以流过
 
-    注意：scheduler.timesteps 是降序的，例如 [999, 979, ..., 19, 0]
-    所以 "早期步" 对应大 timestep，"后期步" 对应小 timestep。
-    K 控制从第几个 step 开始保留梯度（从后往前数）。
+    K 是 denoising step index。20 步推理时，K=15 表示只更新最后 5 步，
+    K=19 表示只更新最后 1 步。若 args.bptt 传入多个候选值，每次采样随机选一个。
+
+    返回 (images, anchor_states)：anchor_states 是本次去噪真实经过的
+    (x_t.detach(), t) 列表（凡 LoRA 激活的步都收，不在此按 t 过滤）。
+    t 窗口 [traj_anchor_t_min, traj_anchor_t_max] 的过滤在消费端做（选锚点时），
+    供 on-trajectory anchor 使用——锚在生成真正访问过的状态上，而非随机高斯。
     """
     latent_size = resolution // 8
     target_dtype = dtype
@@ -735,21 +765,68 @@ def sample_latents_with_grad(
     )
     latents = (latents * scheduler.init_noise_sigma).to(dtype=target_dtype)
 
-    # 随机采样截断点 K：从第 K 步开始才保留梯度
+    # 采样截断点 K：从第 K 步开始才保留梯度
     total_steps = len(scheduler.timesteps)
-    if truncated_backprop_rand:
+    if args is not None and hasattr(args, "bptt"):
+        bptt_candidates = args.bptt
+        if isinstance(bptt_candidates, int):
+            bptt_candidates = [bptt_candidates]
+        K = random.choice(list(bptt_candidates))
+    elif truncated_backprop_rand:
         K = random.randint(
             truncated_backprop_minmax[0],
             min(truncated_backprop_minmax[1], total_steps - 1),
         )
     else:
-        K = truncated_backprop_minmax[1]  # 固定截断点
-    K = 18
+        K = min(truncated_backprop_minmax[1], total_steps - 1)
+    # print(f"k={K}")
+    eta = args.ddim_eta
+    lora_last_steps = (
+        getattr(args, "lora_last_steps", None) if args is not None else None
+    )
+    lora_start_step = 0 if lora_last_steps is None else total_steps - lora_last_steps
+    adapter_state_model = get_adapter_state_model(unet)
+
+    # on-trajectory anchor：缓存 LoRA 真正激活的步真实经过的 (x_t, t)。
+    # x_t 是 UNet 在该步收到的输入（detach 后仅 ~0.05MB/个）。
+    # 关键：锚点必须落在 LoRA 激活处——门控 (--lora_last_steps) 下 LoRA 只在最后
+    # 几步 (低 t) 激活，此时 [traj_anchor_t_min,max]=[400,999] 完全避开门控窗口，
+    # 会导致锚点全为空/恒 0。故这里按"LoRA 是否激活"收集，而非按固定 t 区间。
+    # eps-budget 的 hinge 会自动只在偏离超预算的步上产生梯度，无需再按 t 精选。
+    anchor_states = []
+
     for step_idx, timestep in enumerate(scheduler.timesteps):
+        t_int = int(timestep)
+        # disable_lora_all: 全程关 LoRA，用于生成 base 纹理（颜色 anchor 的锚点）。
+        lora_active = (not disable_lora_all) and (step_idx >= lora_start_step)
+        lora_context = (
+            nullcontext() if lora_active else disable_lora_context(adapter_state_model)
+        )
+        if lora_active:
+            anchor_states.append((latents.detach(), t_int))
         # step_idx < K：截断，不保留梯度（减少显存，防止 mode collapse）
         # step_idx >= K：保留梯度，参与 reward backprop
         if step_idx < K:
             with torch.no_grad():
+                with lora_context:
+                    latents = _ddim_step(
+                        unet,
+                        scheduler,
+                        latents,
+                        timestep,
+                        prompt_embeds,
+                        pooled_prompt_embeds,
+                        negative_prompt_embeds,
+                        negative_pooled_prompt_embeds,
+                        add_time_ids,
+                        guidance_scale,
+                        target_dtype,
+                        eta,
+                    )
+                latents = latents.detach()  # 显式断开计算图
+        else:
+            # gradient checkpointing 在外部通过 unet.enable_gradient_checkpointing() 控制
+            with lora_context:
                 latents = _ddim_step(
                     unet,
                     scheduler,
@@ -762,23 +839,8 @@ def sample_latents_with_grad(
                     add_time_ids,
                     guidance_scale,
                     target_dtype,
+                    eta,
                 )
-                latents = latents.detach()  # 显式断开计算图
-        else:
-            # gradient checkpointing 在外部通过 unet.enable_gradient_checkpointing() 控制
-            latents = _ddim_step(
-                unet,
-                scheduler,
-                latents,
-                timestep,
-                prompt_embeds,
-                pooled_prompt_embeds,
-                negative_prompt_embeds,
-                negative_pooled_prompt_embeds,
-                add_time_ids,
-                guidance_scale,
-                target_dtype,
-            )
 
     # VAE 解码：latent → pixel image [0, 1]
     # VAE 解码不需要梯度（reward 直接作用在 pixel 上）
@@ -790,7 +852,7 @@ def sample_latents_with_grad(
     )[0]
     images = (images / 2 + 0.5).clamp(0, 1)
 
-    return images
+    return images, anchor_states
 
 
 def _ddim_step(
@@ -805,6 +867,7 @@ def _ddim_step(
     add_time_ids: torch.Tensor,
     guidance_scale: float,
     dtype: torch.dtype,
+    eta=0.0,
 ) -> torch.Tensor:
     """单步 DDIM 去噪（含 classifier-free guidance）"""
     latent_model_input = torch.cat([latents, latents], dim=0)
@@ -831,13 +894,71 @@ def _ddim_step(
     )[0]
 
     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+    # 关键修改：unconditional CFG 分支不接收检测器 reward 梯度
+
+    noise_pred_uncond = noise_pred_uncond.detach()
+
     guided_noise_pred = noise_pred_uncond + guidance_scale * (
         noise_pred_text - noise_pred_uncond
     )
     guided_noise_pred = guided_noise_pred.to(dtype=dtype)
 
-    latents = scheduler.step(guided_noise_pred, timestep, latents, return_dict=False)[0]
+    latents = scheduler.step(
+        guided_noise_pred, timestep, latents, eta=eta, return_dict=False
+    )[0]
     return latents.to(dtype=dtype)
+
+
+def get_base_color_hist(
+    cache: dict,
+    prompt_key: str,
+    unet,
+    vae,
+    scheduler,
+    prompt_embeds,
+    pooled_prompt_embeds,
+    negative_prompt_embeds,
+    negative_pooled_prompt_embeds,
+    add_time_ids,
+    device,
+    dtype,
+    resolution: int,
+    guidance_scale: float,
+    args,
+    uv_mask,
+    bins: int,
+    sigma: float,
+):
+    """
+    取（或惰性生成并缓存）某 prompt 的 base 纹理颜色直方图。
+
+    base = 全程关 LoRA 采样出的纹理（disable_lora_all=True）。颜色分布对
+    初始噪声不敏感（同 prompt 同色调），故每 prompt 只生成一次、缓存直方图
+    （几十个数），后续复用。key 用 prompt 字符串。
+    """
+    if prompt_key in cache:
+        return cache[prompt_key]
+    with torch.no_grad():
+        base_img, _ = sample_latents_with_grad(
+            unet,
+            vae,
+            scheduler,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            negative_prompt_embeds,
+            negative_pooled_prompt_embeds,
+            add_time_ids,
+            device,
+            dtype,
+            1,
+            resolution,
+            guidance_scale,
+            args=args,
+            disable_lora_all=True,
+        )
+        hist = soft_color_histogram(base_img, uv_mask, bins, sigma).detach()
+    cache[prompt_key] = hist
+    return hist
 
 
 def prune_checkpoints(output_dir: str, total_limit: Optional[int]):
@@ -852,13 +973,6 @@ def prune_checkpoints(output_dir: str, total_limit: Optional[int]):
     remove_count = len(checkpoints) - total_limit + 1
     for checkpoint in checkpoints[:remove_count]:
         shutil.rmtree(Path(output_dir) / checkpoint, ignore_errors=True)
-
-
-def iter_prompt_groups(prompt_groups):
-    for camo_type, sections in prompt_groups.items():
-        for section_name, prompts in sections.items():
-            for prompt_index, prompt in enumerate(prompts):
-                yield camo_type, section_name, prompt_index, prompt
 
 
 def parse_prompt_specs(prompt_specs: Sequence[str], available_keys: Sequence[str]):
@@ -938,270 +1052,6 @@ def build_prompt_list_from_specs(all_prompts, prompt_specs: Sequence[str]):
     return selected_prompts, selected_counts
 
 
-@torch.inference_mode()
-def run_quick_asr_eval(
-    global_step: int,
-    checkpoint_dir: Path,
-    args,
-    accelerator,
-    tokenizer_one,
-    tokenizer_two,
-    text_encoder_one,
-    text_encoder_two,
-    vae,
-    unet,
-    base_scheduler,
-    weight_dtype,
-    texture_render_model,
-    yolo_model,
-):
-    unet.eval()
-    quick_cam = {
-        "dist": [7.0, 8.0, 9.0, 10.0],
-        "elev": [0.0, 10.0, 20.0],
-        "azim": list(range(0, 360, 30)),
-    }
-    backgrounds_quick = [
-        "data/background/desert/desert_00011.jpg",
-        "data/background/jungle/jungle_00020.jpg",
-        "data/background/sunset/sunset_00004.jpg",
-        "data/background/snow/snow_00002.jpg",
-    ]
-    quick_eval_dir = checkpoint_dir / "quick_eval_images"
-    quick_eval_dir.mkdir(parents=True, exist_ok=True)
-    quick_eval_log_path = checkpoint_dir / f"quick_eval_{global_step}.log"
-
-    background_images = {
-        background_path: Image.open(background_path).convert("RGB")
-        for background_path in backgrounds_quick
-    }
-    prompt_groups = get_prompts_by_speed("quick", clean=True)
-    texture_render_model.set_light_location(DEFAULT_LIGHT_LOCATION)
-
-    with quick_eval_log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write("global_step#type#prompt#total_views#detection_rate\n")
-        ALL_detections = 0
-        ALL_views = 0
-        for camo_type, section_name, prompt_index, prompt in iter_prompt_groups(
-            prompt_groups
-        ):
-            logger.info(
-                "Quick ASR eval: type=%s/%s, prompt=%s",
-                camo_type,
-                section_name,
-                prompt,
-            )
-            scheduler = prepare_scheduler_ddim(base_scheduler, args.num_inference_steps)
-            # scheduler = base_scheduler
-            # scheduler.set_timesteps(args.num_inference_steps)
-            (
-                prompt_embeds,
-                pooled_prompt_embeds,
-                negative_prompt_embeds,
-                negative_pooled_prompt_embeds,
-            ) = make_text_embeddings(
-                tokenizer_one,
-                tokenizer_two,
-                text_encoder_one,
-                text_encoder_two,
-                [prompt],
-                args.negative_prompt,
-                args.tokenizer_max_length,
-                args.text_encoder_use_attention_mask,
-            )
-            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
-            pooled_prompt_embeds = pooled_prompt_embeds.to(
-                accelerator.device, dtype=weight_dtype
-            )
-            negative_prompt_embeds = negative_prompt_embeds.to(
-                accelerator.device, dtype=weight_dtype
-            )
-            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(
-                accelerator.device, dtype=weight_dtype
-            )
-            add_time_ids = build_sdxl_time_ids(
-                batch_size=1,
-                resolution=args.resolution,
-                device=accelerator.device,
-                dtype=weight_dtype,
-            )
-
-            with torch.no_grad():
-                diffusion_image = sample_latents_with_grad(
-                    unet,
-                    vae,
-                    scheduler,
-                    prompt_embeds,
-                    pooled_prompt_embeds,
-                    negative_prompt_embeds,
-                    negative_pooled_prompt_embeds,
-                    add_time_ids,
-                    accelerator.device,
-                    weight_dtype,
-                    1,
-                    args.resolution,
-                    args.guidance_scale,
-                )
-
-            prompt_tag = f"{camo_type}_{section_name}_{prompt_index:02d}"
-            texture_image_path = quick_eval_dir / f"{prompt_tag}.png"
-            prompt_text_path = quick_eval_dir / f"{prompt_tag}.txt"
-            tensor_rgb_to_pil(diffusion_image).save(texture_image_path)
-            prompt_text_path.write_text(prompt, encoding="utf-8")
-
-            for background_path, background_image in background_images.items():
-                type_key = f"{camo_type}/{section_name}/{Path(background_path).stem}"
-                asr_dict = TestASRQuick(
-                    diffusion_image.detach(),
-                    background=background_image,
-                    cam_params=quick_cam,
-                    model=yolo_model.model,
-                    texture_render_model=texture_render_model,
-                    device=str(accelerator.device),
-                )
-                detection_rate = asr_dict["detection_rate"]
-                total_views = asr_dict["total_views"]
-                detected = asr_dict["detected"]
-                not_detected = asr_dict["not_detected"]
-                ALL_detections += detected
-                ALL_views += total_views
-                log_line = f"{global_step}#{type_key}#{prompt}#{total_views}#{detection_rate}\n"
-                log_file.write(log_line)
-                log_file.flush()
-                logger.info(
-                    "Quick ASR result: type=%s, total_views=%s, detection_rate=%s",
-                    type_key,
-                    total_views,
-                    detection_rate,
-                )
-        ALL_rate = ALL_detections / ALL_views
-        log_line = f"{global_step}#{ALL_detections}#{ALL_views}#{ALL_rate:.4f}\n"
-        log_file.write(log_line)
-        log_file.flush()
-
-
-def run_quick_asr_eval_pipeline(
-    global_step: int,
-    checkpoint_dir: Path,
-    args,
-    accelerator,
-    tokenizer_one,
-    tokenizer_two,
-    text_encoder_one,
-    text_encoder_two,
-    vae,
-    unet,
-    base_scheduler,
-    weight_dtype,
-    texture_render_model,
-    yolo_model,
-):
-    unet.eval()
-    quick_cam = {
-        "dist": [7.0, 8.0, 9.0, 10.0],
-        "elev": [0.0, 10.0, 20.0],
-        "azim": list(range(0, 360, 30)),
-    }
-    backgrounds_quick = [
-        "data/background/desert/desert_00011.jpg",
-        "data/background/jungle/jungle_00020.jpg",
-        "data/background/sunset/sunset_00004.jpg",
-        "data/background/snow/snow_00002.jpg",
-    ]
-    quick_eval_dir = checkpoint_dir / "quick_eval_images"
-    quick_eval_dir.mkdir(parents=True, exist_ok=True)
-    quick_eval_log_path = checkpoint_dir / f"quick_eval_{global_step}.log"
-
-    background_images = {
-        background_path: Image.open(background_path).convert("RGB")
-        for background_path in backgrounds_quick
-    }
-    prompt_groups = get_prompts_by_speed("quick", clean=True)
-    texture_render_model.set_light_location(DEFAULT_LIGHT_LOCATION)
-
-    pipeline = StableDiffusionXLPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        tokenizer=tokenizer_one,
-        tokenizer_2=tokenizer_two,
-        text_encoder=text_encoder_one,
-        text_encoder_2=text_encoder_two,
-        vae=vae,
-        unet=unet,
-        scheduler=prepare_scheduler_ddim(base_scheduler, args.num_inference_steps),
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    try:
-        with quick_eval_log_path.open("w", encoding="utf-8") as log_file:
-            log_file.write("global_step#type#prompt#total_views#detection_rate\n")
-            ALL_detections = 0
-            ALL_views = 0
-            for camo_type, section_name, prompt_index, prompt in iter_prompt_groups(
-                prompt_groups
-            ):
-                logger.info(
-                    "Quick ASR eval (pipeline): type=%s/%s, prompt=%s",
-                    camo_type,
-                    section_name,
-                    prompt,
-                )
-
-                with torch.no_grad():
-                    diffusion_image = pipeline(
-                        prompt=prompt,
-                        negative_prompt=args.negative_prompt,
-                        num_inference_steps=args.num_inference_steps,
-                        guidance_scale=args.guidance_scale,
-                        height=args.resolution,
-                        width=args.resolution,
-                    ).images[0]  # type: ignore
-
-                prompt_tag = f"{camo_type}_{section_name}_{prompt_index:02d}"
-                texture_image_path = quick_eval_dir / f"{prompt_tag}.png"
-                prompt_text_path = quick_eval_dir / f"{prompt_tag}.txt"
-                diffusion_image.save(texture_image_path)
-                prompt_text_path.write_text(prompt, encoding="utf-8")
-
-                for background_path, background_image in background_images.items():
-                    type_key = (
-                        f"{camo_type}/{section_name}/{Path(background_path).stem}"
-                    )
-                    asr_dict = TestASRQuick(
-                        diffusion_image,
-                        background=background_image,
-                        cam_params=quick_cam,
-                        model=yolo_model.model,
-                        texture_render_model=texture_render_model,
-                        device=str(accelerator.device),
-                    )
-                    detection_rate = asr_dict["detection_rate"]
-                    total_views = asr_dict["total_views"]
-                    detected = asr_dict["detected"]
-                    not_detected = asr_dict["not_detected"]
-                    ALL_detections += detected
-                    ALL_views += total_views
-                    log_line = f"{global_step}#{type_key}#{prompt}#{total_views}#{detection_rate}\n"
-                    log_file.write(log_line)
-                    log_file.flush()
-                    logger.info(
-                        "Quick ASR result (pipeline): type=%s, total_views=%s, detection_rate=%s",
-                        type_key,
-                        total_views,
-                        detection_rate,
-                    )
-            ALL_rate = ALL_detections / ALL_views
-            log_line = f"{global_step}#{ALL_detections}#{ALL_views}#{ALL_rate:.4f}\n"
-            log_file.write(log_line)
-            log_file.flush()
-    finally:
-        del pipeline
-        free_memory()
-
-
 def main(args):
     ensure_required_paths(args)
 
@@ -1212,15 +1062,12 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with="tensorboard",
         project_config=accelerator_project_config,
     )
 
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
-
-    if args.report_to == "wandb" and not is_wandb_available():
-        raise ImportError("Install wandb to use `--report_to wandb`.")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -1245,9 +1092,6 @@ def main(args):
     }
 
     accelerator.init_trackers(tracker_name, config=temp_args)
-
-    if args.allow_tf32 and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name
@@ -1300,16 +1144,21 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
-    yolo_reward_model = YoloRewardModel(
-        args.reward_model_path,
-    )
+    if args.reward_model_path == "yolomodel/yolov3lz.pt":
+        from thirdpart.yolov3.yolov3_detector import YoloV3Detector
+
+        yolo_reward_model = YoloV3Detector(
+            args.reward_model_path, device=accelerator.device
+        )
+    else:
+        from utils.yolo import YoloRewardModel
+
+        yolo_reward_model = YoloRewardModel(
+            args.reward_model_path,
+        )
     # 加载clip模型
-    clip_model = CLIPModel.from_pretrained(
-        "/mnt/data/dk/hf/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
-    )
-    clip_processor = CLIPProcessor.from_pretrained(
-        "/mnt/data/dk/hf/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
-    )
+    clip_model = CLIPModel.from_pretrained(args.clip_path)
+    clip_processor = CLIPProcessor.from_pretrained(args.clip_path)
     clip_model.eval()
 
     text_encoder.requires_grad_(False)
@@ -1326,8 +1175,14 @@ def main(args):
 
     # SDXL 训练中保持 VAE 为 fp32，避免解码出现黑图/NaN。
     vae_dtype = torch.float32
-    roa = ROA()  # 实例化 ROA
-    roa.to(accelerator.device)
+    if args.use_roa:
+        roa = ROA()  # 实例化 ROA
+        roa.to(accelerator.device)
+    else:
+        roa = None
+
+    roa_diffusion_image = ROADiffusionImage()
+    roa_diffusion_image.to(accelerator.device)
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=vae_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -1338,47 +1193,33 @@ def main(args):
     uv_mask = load_uv_mask(
         args.uv_mask_path, args.texture_image_size, accelerator.device
     )
+    if args.renderer_backend == "nvdiffrast":
+        from meshrender.nvdiffrast_uv import NvdiffrastTextureRenderModel
 
-    texture_render_model = TextureRenderModel(
-        device=accelerator.device,
-        mesh_obj_path=args.mesh_obj_path,
-        uv_mask=uv_mask,
-        render_image_size=args.render_image_size,
-        texture_image_size=args.texture_image_size,
-        background_fill_value=args.background_fill_value,
-    )
-
-    texture_render_model.to(accelerator.device)
-    render_sampling_state = RenderSamplingState(args, accelerator.device)
-    logger.info(
-        "Camera sampler `%s` configured with %d reward views, elevation=[%.1f, %.1f] mode=%.1f, distance=[%.1f, %.1f] mode=%.1f, azimuth_bins=%d.",
-        args.camera_sampler,
-        args.num_reward_views,
-        args.camera_elevation_min,
-        args.camera_elevation_max,
-        args.camera_elevation_mode,
-        args.camera_distance_min,
-        args.camera_distance_max,
-        args.camera_distance_mode,
-        args.camera_azimuth_bins,
-    )
-    if args.randomize_lighting:
-        logger.info(
-            "Lighting randomization enabled with elevation=[%.1f, %.1f] mode=%.1f, distance=[%.1f, %.1f] mode=%.1f, azimuth=[%.1f, %.1f].",
-            args.light_elevation_min,
-            args.light_elevation_max,
-            args.light_elevation_mode,
-            args.light_distance_min,
-            args.light_distance_max,
-            args.light_distance_mode,
-            args.light_azimuth_min,
-            args.light_azimuth_max,
+        texture_render_model = NvdiffrastTextureRenderModel(
+            device=accelerator.device,
+            mesh_obj_path=args.mesh_obj_path,
+            uv_mask=uv_mask,
+            render_image_size=args.render_image_size,
+            texture_image_size=args.texture_image_size,
+            background_fill_value=args.background_fill_value,
+            use_carla_mesh_transform=args.use_carla_mesh_transform,
+            # use_antialias=True,
+            texture_filter_mode=args.nvdiffrast_texture_filter,
         )
     else:
-        logger.info(
-            "Lighting randomization disabled; using fixed light at %s.",
-            DEFAULT_LIGHT_LOCATION,
+        texture_render_model = TextureRenderModel(
+            device=accelerator.device,
+            mesh_obj_path=args.mesh_obj_path,
+            uv_mask=uv_mask,
+            render_image_size=args.render_image_size,
+            texture_image_size=args.texture_image_size,
+            background_fill_value=args.background_fill_value,
+            use_carla_mesh_transform=args.use_carla_mesh_transform,
+            raster_blur_radius=0,
+            raster_faces_per_pixel=1,
         )
+    texture_render_model.to(accelerator.device)
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -1406,11 +1247,36 @@ def main(args):
         lora_alpha=args.rank,
         lora_dropout=args.lora_dropout,
         init_lora_weights="gaussian",
+        # use_rslora=args.use_rslora,
         # target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
         target_modules=lora_target_modules,
     )
     unet.add_adapter(unet_lora_config)
     cast_training_params([unet], dtype=torch.float32)
+
+    if args.init_lora_path:
+        # 从 save_lora_weights 保存的 checkpoint 热启动（诊断/续训用）。
+        from diffusers.utils import convert_unet_state_dict_to_peft
+        from peft.utils import set_peft_model_state_dict
+
+        lora_state, _ = StableDiffusionXLPipeline.lora_state_dict(args.init_lora_path)
+        unet_state = {
+            k.replace("unet.", "", 1): v
+            for k, v in lora_state.items()
+            if k.startswith("unet.")
+        }
+        unet_state = convert_unet_state_dict_to_peft(unet_state)
+        incompatible = set_peft_model_state_dict(
+            unet, unet_state, adapter_name="default"
+        )
+        unexpected = getattr(incompatible, "unexpected_keys", [])
+        if unexpected:
+            raise ValueError(
+                f"init_lora_path 加载有 unexpected keys（scope/rank 不匹配？）: "
+                f"{unexpected[:5]}..."
+            )
+        cast_training_params([unet], dtype=torch.float32)
+        logger.info("Loaded init LoRA weights from %s", args.init_lora_path)
 
     trainable_lora_names = [
         name
@@ -1422,8 +1288,14 @@ def main(args):
         len(trainable_lora_names),
         args.lora_scope,
     )
-    # for name in trainable_lora_names:
-    #     logger.info("LoRA trainable param: %s", name)
+    if args.lora_last_steps is None:
+        logger.info("LoRA is enabled for all denoising steps.")
+    else:
+        logger.info(
+            "LoRA is enabled only for the final %d/%d denoising steps.",
+            args.lora_last_steps,
+            args.num_inference_steps,
+        )
 
     params_to_optimize = [
         parameter for parameter in unet.parameters() if parameter.requires_grad
@@ -1437,89 +1309,83 @@ def main(args):
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
-    # 加载背景数据集
-    background_batch_size = (
-        args.num_reward_views if args.different_view_backgrounds else 1
+    from data.dataset import make_loader
+    if args.use_old_data:
+        root = [
+            "data/datas/origin/si54/sunny/6m",
+            "data/datas/origin/si54/sunny/8m",
+            "data/datas/origin/si54/sunny/10m",
+            "data/datas/origin/si54/sunny/12m",
+            "data/datas/origin/si139/sunny/6m",
+            "data/datas/origin/si139/sunny/8m",
+            "data/datas/origin/si139/sunny/10m",
+            "data/datas/origin/si139/sunny/12m",
+        ]
+    else:
+        root = [
+            "data/datas/origin/si103/day_clear/8m",
+            "data/datas/origin/si103/day_clear/10m",
+            "data/datas/origin/si103/day_clear/12m",
+            "data/datas/origin/si103/day_cloudy/8m",
+            "data/datas/origin/si103/day_cloudy/10m",
+            "data/datas/origin/si103/day_cloudy/12m",
+            "data/datas/origin/si103/night_clear/8m",
+            "data/datas/origin/si103/night_clear/10m",
+            "data/datas/origin/si103/night_clear/12m",
+            "data/datas/origin/si103/night_cloudy/8m",
+            "data/datas/origin/si103/night_cloudy/10m",
+            "data/datas/origin/si103/night_cloudy/12m",
+            "data/datas/origin/si139/sunny/6m",
+            "data/datas/origin/si139/sunny/8m",
+            "data/datas/origin/si139/sunny/10m",
+            "data/datas/origin/si139/sunny/12m",
+            "data/datas/origin/si47/day_clear/8m",
+            "data/datas/origin/si47/day_clear/10m",
+            "data/datas/origin/si47/day_clear/12m",
+            "data/datas/origin/si47/day_cloudy/8m",
+            "data/datas/origin/si47/day_cloudy/10m",
+            "data/datas/origin/si47/day_cloudy/12m",
+            "data/datas/origin/si47/night_clear/8m",
+            "data/datas/origin/si47/night_clear/10m",
+            "data/datas/origin/si47/night_clear/12m",
+            "data/datas/origin/si47/night_cloudy/8m",
+            "data/datas/origin/si47/night_cloudy/10m",
+            "data/datas/origin/si47/night_cloudy/12m",
+            "data/datas/origin/si54/sunny/6m",
+            "data/datas/origin/si54/sunny/8m",
+            "data/datas/origin/si54/sunny/10m",
+            "data/datas/origin/si54/sunny/12m",
+            "data/datas/origin/si70/day_clear/8m",
+            "data/datas/origin/si70/day_clear/10m",
+            "data/datas/origin/si70/day_clear/12m",
+            "data/datas/origin/si70/day_cloudy/8m",
+            "data/datas/origin/si70/day_cloudy/10m",
+            "data/datas/origin/si70/day_cloudy/12m",
+            "data/datas/origin/si70/night_clear/8m",
+            "data/datas/origin/si70/night_clear/10m",
+            "data/datas/origin/si70/night_clear/12m",
+            "data/datas/origin/si70/night_cloudy/8m",
+            "data/datas/origin/si70/night_cloudy/10m",
+            "data/datas/origin/si70/night_cloudy/12m",
+            # "data/datas/origin/si75/sunny/8m",
+            # "data/datas/origin/si75/sunny/10m",
+            # "data/datas/origin/si75/sunny/12m",
+        ]
+    carla_ds, carla_loader = make_loader(
+        root=root,
+        batch_size=args.num_reward_views,
+        shuffle=True,
+        num_workers=4,
     )
-    dataloader = get_background_dataloader(
-        # "data/background", category=["jungle", "sunset","snow"], batch_size=1
-        "data/background",
-        # category=["sunset"],
-        category=[
-            "jungle",
-            "sunset",
-            "snow",
-            "desert",
-            "foggyroad",
-            "rainroad",
-            "nightroad",
-            "sunroad",
-        ],
-        # category=["jungle", "sunset", "snow", "desert"],
-        batch_size=background_batch_size,
-    )
-    background_count = len(dataloader.dataset)
-    if accelerator.is_main_process:
-        logger.info("Loaded %d background images.", background_count)
-    if args.different_view_backgrounds:
-        if background_count < args.num_reward_views:
-            raise ValueError(
-                "`different_view_backgrounds` requires at least "
-                f"{args.num_reward_views} background images, got {background_count}."
-            )
-        logger.info(
-            "Different backgrounds per reward view enabled; background batch size=%d.",
-            background_batch_size,
-        )
-    natural_texture_colors = [
-        # 绿色系（植被/爬虫/丛林）
-        "olive green",
-        "forest green",
-        "moss green",
-        "sage green",
-        "pine green",
-        "emerald green",
-        "jade green",
-        "fern green",
-        # 棕褐色系（大地/皮毛/树皮）
-        "taupe brown",
-        "chestnut brown",
-        "walnut brown",
-        "mahogany brown",
-        "caramel brown",
-        "umber brown",
-        "sepia brown",
-        # 黄/土色系（沙漠/沙土/斑纹）
-        "sand beige",
-        "khaki beige",
-        "ochre yellow",
-        "amber yellow",
-        "wheat yellow",
-        "mustard yellow",
-        # 灰/黑/白色系（雪地/岩石/斑纹）
-        "slate grey",
-        "ash grey",
-        "silver grey",
-        "charcoal black",
-        "ivory white",
-        "snow white",
-        "cream off-white",
-        # 蓝/青/冷色系（水生/昆虫/深海）
-        "teal blue",
-        "slate blue",
-        "navy blue",
-        "cerulean blue",
-        # 红/橙/金属色系（斑纹/甲壳/鳞片）
-        "rust red",
-        "terracotta red",
-        "burnt orange",
-        "copper orange",
-    ]
-    unet, optimizer, lr_scheduler, dataloader = accelerator.prepare(
-        unet, optimizer, lr_scheduler, dataloader
+    unet, optimizer, lr_scheduler, carla_loader = accelerator.prepare(
+        unet, optimizer, lr_scheduler, carla_loader
     )
 
     global_step = 0
+    # per-prompt base 纹理颜色直方图缓存（颜色分布 anchor 用，惰性填充）
+    base_color_hist_cache = {}
+    # 多样性排斥 memory bank：存 (prompt, clip_img_feat.detach())。默认关时不使用。
+    diversity_bank = deque(maxlen=args.diversity_bank_size)
     from data.prompt import ALL_PROMPTS
 
     total_prompts, selected_counts = build_prompt_list_from_specs(
@@ -1534,231 +1400,559 @@ def main(args):
             stats["take"],
             stats["total"],
         )
-    logger.info("Total selected prompts: %d", len(total_prompts))
-    # for step in range(args.max_train_steps):
-    # total_prompts = mix
-    stop_training = False
-    for epoch in range(1, 100000):
-        for idx, bgdata in enumerate(dataloader):
-            scheduler = prepare_scheduler_ddim(base_scheduler, args.num_inference_steps)
-            # scheduler = base_scheduler
-            # scheduler.set_timesteps(args.num_inference_steps)
-            # scheduler.set_timesteps(random.randint(15,35))
-            color = f", {random.choice(natural_texture_colors)}"
-            prompts = [random.choice(total_prompts) + color]
-            with accelerator.accumulate(unet):
-                (
+    logger.info("Total selected prompts (legacy pool): %d", len(total_prompts))
+
+    prompt_pool: Optional[PromptPool, PromptPoolCodex] = None
+
+    if args.use_prompt_pool:
+        prompt_pool = PromptPool(
+            seed=args.prompt_pool_seed,
+            p_neutral=args.prompt_p_neutral,
+            holdout_per_axis=args.prompt_holdout_per_axis,
+            holdout_combos=args.prompt_holdout_combos,
+        )
+        if accelerator.is_main_process:
+            split_path = Path(args.output_dir) / "prompt_split.json"
+            prompt_pool.save_split(split_path)
+            logger.info(
+                "Prompt pool initialized (seed=%d, p_neutral=%.2f). Split saved to %s",
+                args.prompt_pool_seed,
+                args.prompt_p_neutral,
+                split_path,
+            )
+            desc = prompt_pool.describe()
+            logger.info(
+                "Train values per axis: %s",
+                {k: len(v) for k, v in desc["train_values"].items()},
+            )
+            logger.info("OOD values per axis : %s", desc["ood_values"])
+            logger.info("Held-out comp pairs : %d", len(desc["comp_pairs"]))
+
+    if args.use_prompt_pool_codex:
+        prompt_pool = PromptPoolCodex(
+            seed=args.prompt_pool_seed,
+            p_neutral=args.prompt_p_neutral,
+            holdout_per_axis=args.prompt_holdout_per_axis,
+            holdout_combos=args.prompt_holdout_combos,
+        )
+    carla_iter = cycle_dataloader(carla_loader)
+    idx = 0
+    while global_step < args.max_train_steps:
+        batch = next(carla_iter)
+        scheduler = prepare_scheduler_ddim(base_scheduler, args.num_inference_steps)
+
+        if prompt_pool is not None:
+            pool_sample = prompt_pool.sample_train()
+            prompts = [pool_sample.text]
+        else:
+            # 兼容旧路径：单 prompt + 颜色拼接
+            prompts = [random.choice(total_prompts)]
+        with accelerator.accumulate(unet):
+            (
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = make_text_embeddings(
+                tokenizer,
+                tokenizer_two,
+                text_encoder,
+                text_encoder_two,
+                prompts,
+                args.negative_prompt,
+                args.tokenizer_max_length,
+                args.text_encoder_use_attention_mask,
+            )
+            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            negative_prompt_embeds = negative_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(
+                accelerator.device, dtype=weight_dtype
+            )
+            add_time_ids = build_sdxl_time_ids(
+                batch_size=args.reward_batch_size,
+                resolution=args.resolution,
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+            # bchw
+            diffusion_images, traj_anchor_states = sample_latents_with_grad(
+                unet,
+                vae,
+                scheduler,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                add_time_ids,
+                accelerator.device,
+                weight_dtype,
+                args.reward_batch_size,
+                args.resolution,
+                args.guidance_scale,
+                args=args,
+            )
+            clip_need_grad = True
+            if args.clip_weight == 0:
+                clip_need_grad = False
+            # masked-CLIP：只在 UV mask 内计分。mask 乘法把 mask 外像素的 CLIP 梯度
+            # 归零，使 CLIP 梯度支撑与 reward 梯度支撑重合，逼模型在"上车纹理"上兼顾
+            # prompt 与生成的纹理，而不是把 prompt 一致性外包给 mask 外的免费面积。
+            if args.clip_uv_masked:
+                clip_mask = uv_mask.unsqueeze(0).to(dtype=diffusion_images.dtype)
+                if clip_mask.shape[-2:] != diffusion_images.shape[-2:]:
+                    clip_mask = torch.nn.functional.interpolate(
+                        clip_mask, size=diffusion_images.shape[-2:], mode="nearest"
+                    )
+                clip_input = diffusion_images * clip_mask + args.clip_mask_fill * (
+                    1 - clip_mask
+                )
+            else:
+                clip_input = diffusion_images
+            clip_score = clip_text_image_similarity(
+                clip_processor,
+                clip_model,
+                clip_input,
+                prompts,
+                accelerator.device,
+                needgrad=clip_need_grad,
+            )
+            # 全图 CLIP：仅用于日志，便于与历史(未 mask) run 对照；不进 loss、不回传。
+            if args.clip_uv_masked:
+                with torch.no_grad():
+                    clip_score_full = clip_text_image_similarity(
+                        clip_processor,
+                        clip_model,
+                        diffusion_images,
+                        prompts,
+                        accelerator.device,
+                        needgrad=False,
+                    )
+            else:
+                clip_score_full = clip_score.detach()
+            # 颜色分布 anchor：只锁颜色、放开结构。用未增强的 LoRA-on 纹理图，
+            # 逐 prompt 锚各自 base 纹理的颜色直方图（惰性生成缓存）。
+            if args.color_weight > 0:
+                base_hists = []
+                for i, prompt_key in enumerate(prompts):
+                    base_hists.append(
+                        get_base_color_hist(
+                            base_color_hist_cache,
+                            prompt_key,
+                            unet,
+                            vae,
+                            scheduler,
+                            prompt_embeds[i : i + 1],
+                            pooled_prompt_embeds[i : i + 1],
+                            negative_prompt_embeds[i : i + 1],
+                            negative_pooled_prompt_embeds[i : i + 1],
+                            add_time_ids[i : i + 1],
+                            accelerator.device,
+                            weight_dtype,
+                            args.resolution,
+                            args.guidance_scale,
+                            args,
+                            uv_mask,
+                            args.color_hist_bins,
+                            args.color_hist_sigma,
+                        )
+                    )
+                base_hist = torch.cat(base_hists, dim=0)
+                loss_color_raw, color_dev = color_distribution_loss(
+                    diffusion_images,
+                    base_hist,
+                    uv_mask,
+                    args.color_hist_bins,
+                    args.color_hist_sigma,
+                    budget=args.color_budget,
+                )
+                loss_color = args.color_weight * loss_color_raw
+            else:
+                loss_color = torch.zeros(
+                    (), device=accelerator.device, dtype=weight_dtype
+                )
+                color_dev = torch.zeros((), device=accelerator.device)
+            # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
+            # CLIP-image 表征。默认关(weight=0)——关时完全不算 CLIP-image forward。
+            if args.diversity_weight > 0:
+                cur_div_feat = clip_image_feature(
+                    clip_processor,
+                    clip_model,
+                    diffusion_images,
+                    accelerator.device,
+                    needgrad=True,
+                )  # (B, D) 归一化，有梯度
+                cur_prompt_key = prompts[0]
+                other_feats = [f for pk, f in diversity_bank if pk != cur_prompt_key]
+                bank_feats = torch.cat(other_feats, dim=0) if other_feats else None
+                loss_div_raw, div_max_sim = diversity_repulsion_loss(
+                    cur_div_feat, bank_feats, margin=args.diversity_margin
+                )
+                loss_div = args.diversity_weight * loss_div_raw
+                diversity_bank.append((cur_prompt_key, cur_div_feat.detach()))
+            else:
+                loss_div = torch.zeros(
+                    (), device=accelerator.device, dtype=weight_dtype
+                )
+                div_max_sim = torch.zeros((), device=accelerator.device)
+            if args.use_diffusion_image_aug:
+                diffusion_images = roa_diffusion_image(diffusion_images)
+
+            reward_outputs = render_reward_multi_view_carla(
+                texture_render_model=texture_render_model,
+                yolo_reward_model=yolo_reward_model,
+                diffusion_images=diffusion_images,
+                carla_batch=batch,
+                carla_dataset=carla_ds,
+                num_views=args.num_reward_views,
+                reward_mode=args.reward_mode,
+                target_class_id=2,
+                roa=roa,
+            )
+            rendered = reward_outputs["rendered_views"]
+            rewardStatus = reward_outputs["reward_status"]
+            reward_value = reward_outputs["reward_value"]
+            reward_values = reward_outputs["reward_values"]
+
+            # 每20步保存一次渲染结果
+            if accelerator.is_main_process and global_step % 100 == 0:
+                # if accelerator.is_main_process and reward_value< 0.05:
+                save_path = Path(args.output_dir) / "save" / str(global_step)
+                save_path.mkdir(parents=True, exist_ok=True)
+                for view_idx in range(len(rendered)):
+                    rendered_image = tensor_rgb_to_pil(rendered[view_idx])
+                    rendered_image.save(f"{save_path}/rendered_view{view_idx}.png")
+            if accelerator.is_main_process and global_step % 20 == 0:
+                texture_min = diffusion_images.detach().amin().item()
+                texture_max = diffusion_images.detach().amax().item()
+                texture_mean = diffusion_images.detach().mean().item()
+                logger.info(
+                    "Step %s: diffusion_images stats min=%.6f max=%.6f mean=%.6f",
+                    global_step,
+                    texture_min,
+                    texture_max,
+                    texture_mean,
+                )
+                rendered_image = tensor_rgb_to_pil(rendered[0])
+                texture_image = tensor_rgb_to_pil(diffusion_images)
+
+                # rendered_image.save(
+                #     f"{args.output_dir}/{global_step}_rendered_images_{idx}.png"
+                # )
+                # texture_image.save(
+                #     f"{args.output_dir}/{global_step}_texture_images_{idx}.png"
+                # )
+
+                combined_image = Image.new(
+                    "RGB",
+                    (
+                        rendered_image.width + texture_image.width,
+                        max(rendered_image.height, texture_image.height),
+                    ),
+                )
+                combined_image.paste(rendered_image, (0, 0))
+                combined_image.paste(texture_image, (rendered_image.width, 0))
+                combined_image.save(
+                    f"{args.output_dir}/{global_step}_combined_images_{idx}.png"
+                )
+                log_prompt_file = f"{args.output_dir}/log.txt"
+                with open(log_prompt_file, "a+") as f:
+                    f.write(f"{global_step}_{prompts}\n")
+                    f.flush()
+
+            # clip正则化项
+            loss_clip_score = args.clip_weight * (1 - clip_score)  # -1,1 -> 0,2,
+            loss_reg = args.lora_reg_weight * lora_regularization(unet)
+            loss_reward = args.reward_weight * reward_value
+            loss_reward_active = (
+                loss_reward if rewardStatus else torch.zeros_like(loss_reward)
+            )
+            loss_reward_values_active = (
+                reward_values if rewardStatus else torch.zeros_like(loss_reward)
+            )
+            if not rewardStatus:
+                logger.info(
+                    f"Step {global_step}: 攻击成功, CLIP Score:   {clip_score.item():.4f}"
+                )
+
+            if args.use_margin_loss:
+                loss_reward_active2, frac_below_margin = margin_detection_loss(
+                    # loss_reward_active,  # (V,) per-view tensor，现在派上用场
+                    loss_reward_values_active,  # (V,) per-view tensor，现在派上用场
+                    margin=args.margin,
+                    loss_type="squared_hinge",
+                    # loss_type="softplus",
+                )
+            else:
+                loss_reward_active2 = loss_reward_values_active.mean()
+                frac_below_margin = torch.Tensor([-1.0])
+
+            reward_loss = loss_reward_active2 * args.reward_weight
+
+            # ------------------------------------------------------
+            should_apply_traj_anchor = (
+                args.traj_anchor_weight > 0 and random.random() < args.traj_anchor_prob
+            )
+            # on-trajectory anchor：从本次真实去噪轨迹里随机挑一个 (x_t, t) 作锚点，
+            # 约束"生成真正经过的状态"上 LoRA ≈ base。
+            # 关键：只在结构区 [t_min, t_max] 内选锚点，避开低 t 的 BPTT 攻击窗口。
+            # 否则锚会落在攻击真正干活的低 t 纹理步上，直接罚掉攻击本身（eps 偏离
+            # 在低 t = 攻击信号，同一 δ 在这里几乎恒触发 hinge，把正则变成反攻击力）。
+            # 窗口内无状态时回退 None → 函数内随机高斯 + randint(t_min,t_max) 兜底。
+            anchor_pool = [
+                (z, t)
+                for (z, t) in traj_anchor_states
+                if args.traj_anchor_t_min <= t <= args.traj_anchor_t_max
+            ]
+            if anchor_pool:
+                anchor_z_t, anchor_timestep = random.choice(anchor_pool)
+            else:
+                anchor_z_t, anchor_timestep = None, None
+
+            if args.use_old_anchor:
+                anchor_z_t, anchor_timestep = None, None
+                
+            if should_apply_traj_anchor:
+                loss_traj_hinge, loss_traj_dev = trajectory_anchor_loss(
+                    unwrap_model(accelerator, unet),
                     prompt_embeds,
                     pooled_prompt_embeds,
-                    negative_prompt_embeds,
-                    negative_pooled_prompt_embeds,
-                ) = make_text_embeddings(
-                    tokenizer,
-                    tokenizer_two,
-                    text_encoder,
-                    text_encoder_two,
-                    prompts,
-                    args.negative_prompt,
-                    args.tokenizer_max_length,
-                    args.text_encoder_use_attention_mask,
+                    add_time_ids,
+                    args.resolution,
+                    accelerator.device,
+                    weight_dtype,
+                    t_min=args.traj_anchor_t_min,
+                    t_max=args.traj_anchor_t_max,
+                    z_t=anchor_z_t,
+                    timesteps=anchor_timestep,
+                    budget=args.traj_anchor_budget,
                 )
-                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
+                loss_traj_raw = loss_traj_hinge
+                loss_traj = args.traj_anchor_weight * loss_traj_hinge
+            else:
+                with torch.no_grad():
+                    loss_traj_raw, loss_traj_dev = trajectory_anchor_loss(
+                        unwrap_model(accelerator, unet),
+                        prompt_embeds,
+                        pooled_prompt_embeds,
+                        add_time_ids,
+                        args.resolution,
+                        accelerator.device,
+                        weight_dtype,
+                        t_min=args.traj_anchor_t_min,
+                        t_max=args.traj_anchor_t_max,
+                        z_t=anchor_z_t,
+                        timesteps=anchor_timestep,
+                        budget=args.traj_anchor_budget,
+                    )
+                loss_traj = torch.zeros(
+                    (), device=accelerator.device, dtype=weight_dtype
                 )
-                negative_prompt_embeds = negative_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
-                )
-                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(
-                    accelerator.device, dtype=weight_dtype
-                )
-                add_time_ids = build_sdxl_time_ids(
-                    batch_size=args.reward_batch_size,
-                    resolution=args.resolution,
-                    device=accelerator.device,
-                    dtype=weight_dtype,
-                )
-                # bchw
-                diffusion_images = sample_latents_with_grad(
-                    unet,
-                    vae,
-                    scheduler,
+
+            loss = (
+                reward_loss
+                + loss_clip_score
+                + loss_reg
+                + loss_traj
+                + loss_color
+                + loss_div
+            )
+            # loss = loss_traj
+            # 清理无用的计算图部分，节省显存
+            if (
+                not rewardStatus
+                and args.clip_weight == 0
+                and args.traj_anchor_weight == 0
+                and args.lora_reg_weight == 0
+            ):
+                global_step += 1
+                idx += 1
+                logs = {
+                    "loss": loss.detach().item(),
+                    "loss_reward": reward_loss.detach().item(),
+                    "loss_reward_raw": loss_reward_active.detach().item(),
+                    "loss_reg": loss_reg.detach().item(),
+                    "loss_clip_score": loss_clip_score.detach().item(),
+                    "loss_traj": loss_traj.detach().item(),
+                    "loss_traj_raw": loss_traj_raw.detach().item(),
+                    "loss_traj_dev": loss_traj_dev.detach().item(),
+                    "loss_color": loss_color.detach().item(),
+                    "color_dev": float(color_dev),
+                    "loss_div": loss_div.detach().item(),
+                    "div_max_sim": float(div_max_sim),
+                    "traj_on": float(should_apply_traj_anchor),
+                    "clip_score": clip_score.detach().item(),
+                    "clip_score_full": clip_score_full.item(),
+                    "reward": reward_value.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "FracBelowMargin": frac_below_margin.detach().item(),
+                }
+                accelerator.log(logs, step=global_step)
+                optimizer.zero_grad(set_to_none=True)
+                del (
+                    loss_reward_active,
+                    loss_reward,
+                    reward_outputs,
+                    rendered,
+                    reward_value,
+                    reward_values,
+                    diffusion_images,
                     prompt_embeds,
                     pooled_prompt_embeds,
                     negative_prompt_embeds,
                     negative_pooled_prompt_embeds,
                     add_time_ids,
-                    accelerator.device,
-                    weight_dtype,
-                    args.reward_batch_size,
-                    args.resolution,
-                    args.guidance_scale,
                 )
-
-                reward_outputs = render_reward_multi_view(
-                    texture_render_model=texture_render_model,
-                    render_sampling_state=render_sampling_state,
-                    yolo_reward_model=yolo_reward_model,
-                    diffusion_images=diffusion_images,
-                    background=bgdata,
-                    num_views=args.num_reward_views,
-                    randomize_lighting=args.randomize_lighting,
-                    different_view_backgrounds=args.different_view_backgrounds,
-                    reward_mode="non_targeted",
-                    target_class_id=2,
-                    roa=roa,
-                )
-
-                # dist, elev, azim = render_sampling_state.sample_camera()
-                # cam = texture_render_model.get_camera(dist=dist, elev=elev, azim=azim)
-                # rendered = texture_render_model(cam, diffusion_images, bgdata)
-                # # rendered = texture_render_model(cam, diffusion_images)
-                # rendered = rendered.permute(0, 3, 1, 2).clamp(0, 1)
-                # rewardStatus, reward_value = yolo_reward_model(
-                #     rendered, "non_targeted", 2
-                # )
-
-                rendered = reward_outputs["rendered_views"][0]
-                rewardStatus = reward_outputs["reward_status"]
-                reward_value = reward_outputs["reward_value"]
-                reward_values = reward_outputs["reward_values"]
-
-                # 每20步保存一次渲染结果
-                # if accelerator.is_main_process and global_step % 20 == 0:
-                if accelerator.is_main_process and idx % 20 == 0:
-                    texture_min = diffusion_images.detach().amin().item()
-                    texture_max = diffusion_images.detach().amax().item()
-                    texture_mean = diffusion_images.detach().mean().item()
-                    logger.info(
-                        "Step %s: diffusion_images stats min=%.6f max=%.6f mean=%.6f",
-                        global_step,
-                        texture_min,
-                        texture_max,
-                        texture_mean,
-                    )
-                    rendered_image = tensor_rgb_to_pil(rendered)
-                    texture_image = tensor_rgb_to_pil(diffusion_images)
-
-                    rendered_image.save(
-                        f"{args.output_dir}/{epoch}_rendered_images_{idx}.png"
-                    )
-                    texture_image.save(
-                        f"{args.output_dir}/{epoch}_texture_images_{idx}.png"
-                    )
-
-                    combined_image = Image.new(
-                        "RGB",
-                        (
-                            rendered_image.width + texture_image.width,
-                            max(rendered_image.height, texture_image.height),
-                        ),
-                    )
-                    combined_image.paste(rendered_image, (0, 0))
-                    combined_image.paste(texture_image, (rendered_image.width, 0))
-                    combined_image.save(
-                        f"{args.output_dir}/{epoch}_combined_images_{idx}.png"
-                    )
-                clip_score = clip_text_image_similarity(
-                    clip_processor,
-                    clip_model,
-                    diffusion_images,
-                    prompts,
-                    accelerator.device,
-                    needgrad=True,
-                )
-                # clip正则化项
-                loss_clip_score = args.clip_weight * (1 - clip_score)  # -1,1 -> 0,2,
-                loss_reg = args.lora_reg_weight * lora_regularization(unet)
-                loss_reward = args.reward_weight * reward_value
-                loss_reward_active = (
-                    loss_reward if rewardStatus else torch.zeros_like(loss_reward)
-                )
-                if not rewardStatus:
-                    logger.info(
-                        f"Step {global_step}: 攻击成功, CLIP Score:   {clip_score.item():.4f}"
-                    )
-                    loss = loss_reg + (1 - clip_score)
-                else:
-                    loss = loss_reward_active + loss_reg + loss_clip_score
-                # add clip gate
-                # reward_margin = 0.15
-                # reward_loss = args.reward_weight * torch.relu(reward_values - reward_margin).mean()
-
-                # clip_gate = (reward_values.detach().max() > reward_margin).float()
-                # clip_loss = clip_gate * args.clip_weight * (1 - clip_score)
-
-                # loss_reg = args.lora_reg_weight * lora_regularization(unet)
-                # loss = reward_loss + clip_loss + loss_reg
-                # end clip gate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                # optimizer.zero_grad(set_to_none=False)
-                optimizer.zero_grad()
-                if accelerator.is_main_process and global_step % 1 == 0:
-                    reward_values_text = ", ".join(
-                        f"{value:.4f}"
-                        for value in reward_values.detach().cpu().tolist()
-                    )
-                    # reward_values_text = f"{reward_value.item():.4f}"
-                    logger.info(
-                        f"Step {global_step}: Loss={loss.detach().item():.4f}, LossReward={loss_reward_active.detach().item():.4f}, LossReg={loss_reg.detach().item():.4f}, LossClip={loss_clip_score.detach().item():.4f}, RewardMean={reward_value.detach().item():.4f}, RewardViews=[{reward_values_text}], LR={lr_scheduler.get_last_lr()[0]:.6f}"
-                    )
-                    logger.info(
-                        f"Step {global_step}: Prompts: {prompts}, CLIP Score:   {clip_score.item():.4f}"
-                    )
-
-            if accelerator.sync_gradients:
-                global_step += 1
-                logs = {
-                    "loss": loss.detach().item(),
-                    "loss_reward": loss_reward_active.detach().item(),
-                    "loss_reg": loss_reg.detach().item(),
-                    "loss_clip_score": loss_clip_score.detach().item(),
-                    "reward": reward_value.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                }
-                accelerator.log(logs, step=global_step)
-                if global_step >= args.max_train_steps:
-                    stop_training = True
-                    break
-                # 每 N次 梯度步保存一次 LoRA 权重检查点，并进行评估
-                if (
-                    accelerator.is_main_process
-                    and global_step % args.checkpointing_steps == 0
-                ):
-                    prune_checkpoints(args.output_dir, args.checkpoints_total_limit)
-                    checkpoint_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    unwrapped_unet = unwrap_model(accelerator, unet)
-                    # unwrapped_unet = unwrap_model(accelerator, unet).to(torch.float32)
-                    unet_lora_state_dict = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(unwrapped_unet)
-                    )
-                    StableDiffusionXLPipeline.save_lora_weights(
-                        save_directory=checkpoint_dir,
-                        unet_lora_layers=unet_lora_state_dict,
-                    )
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                continue  # reward太小不更新了，节省计算
+            grad_norm_logs = {}
+            should_log_grad_norms = (
+                args.grad_norm_logging_steps > 0
+                and accelerator.sync_gradients
+                and global_step % args.grad_norm_logging_steps == 0
+            )
+            if should_log_grad_norms:
+                # 每个损失单独的 LoRA 梯度向量（fp32, detached），测范数 + 两两余弦。
+                # 余弦判"方向冲突"(PCGrad 适用)，范数比判"量级失衡"(GradNorm 适用)。
+                grad_vecs = {
+                    "reward": loss_lora_grad_flat(reward_loss, params_to_optimize),
+                    "clip": loss_lora_grad_flat(loss_clip_score, params_to_optimize),
+                    "reg": loss_lora_grad_flat(loss_reg, params_to_optimize),
+                    "traj": loss_lora_grad_flat(loss_traj, params_to_optimize)
+                    if should_apply_traj_anchor
+                    else None,
+                }
+                grad_norms = {
+                    name: (vec.norm().item() if vec is not None else 0.0)
+                    for name, vec in grad_vecs.items()
+                }
+                grad_norm_logs = {
+                    f"grad_norm_{name}_lora": value
+                    for name, value in grad_norms.items()
+                }
+                # 兼容旧日志键名
+                reward_grad_norm_item = grad_norms["reward"]
+                clip_grad_norm_item = grad_norms["clip"]
+                grad_cos_pairs = [
+                    ("reward", "clip"),
+                    ("reward", "traj"),
+                    ("reward", "reg"),
+                    ("clip", "traj"),
+                ]
+                grad_cos_logs = {}
+                for name_a, name_b in grad_cos_pairs:
+                    vec_a, vec_b = grad_vecs[name_a], grad_vecs[name_b]
+                    if (
+                        vec_a is None
+                        or vec_b is None
+                        or grad_norms[name_a] == 0.0
+                        or grad_norms[name_b] == 0.0
+                    ):
+                        continue
+                    cos = (vec_a @ vec_b) / (vec_a.norm() * vec_b.norm() + 1e-12)
+                    grad_cos_logs[f"grad_cos_{name_a}_{name_b}"] = cos.item()
+                grad_norm_logs.update(grad_cos_logs)
+                del grad_vecs
+            # end clip gate
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            # optimizer.zero_grad(set_to_none=False)
+            optimizer.zero_grad()
+            if accelerator.is_main_process and global_step % 1 == 0:
+                reward_values_text = ", ".join(
+                    f"{value:.4f}" for value in reward_values.detach().cpu().tolist()
+                )
+                # reward_values_text = f"{reward_value.item():.4f}"
+                logger.info(
+                    f"Step {global_step}: Loss={loss.detach().item():.4f}, "
+                    f"LossReward={reward_loss.detach().item():.4f}, "
+                    f"LossReward_raw={loss_reward_active.detach().item():.4f}, "
+                    f"LossColor={loss_color.detach().item():.6f}, "
+                    f"ColorDev={float(color_dev):.4f}, "
+                    f"LossDiv={loss_div.detach().item():.6f}, "
+                    f"DivMaxSim={float(div_max_sim):.4f}, "
+                    # f"LossReg={loss_reg.detach().item():.8f}, "
+                    # f"LossClip={loss_clip_score.detach().item():.4f}, "
+                    # f"LossTraj={loss_traj.detach().item():.8f}, "
+                    # f"LossTraj_raw={loss_traj_raw.detach().item():.8f}, "
+                    # f"TrajDev={loss_traj_dev.detach().item():.6f}, "
+                    # f"TrajOn={int(should_apply_traj_anchor)}, "
+                    # f"ClipScore={clip_score.detach().item():.4f}, "
+                    # f"ClipScoreFull={clip_score_full.item():.4f}, "
+                    # f"RewardMean={reward_value.detach().item():.4f}, "
+                    # f"FracBelowMargin={frac_below_margin.detach().item():.3f}, "
+                    # f"reward_values_text={reward_values_text}, "
+                    # f"LR={lr_scheduler.get_last_lr()[0]:.6f}"
+                )
+                logger.info(f"Step {global_step}: Prompts: {prompts}")
+                if grad_norm_logs:
+                    cos_text = ", ".join(
+                        f"cos({name_a},{name_b})={grad_cos_logs[f'grad_cos_{name_a}_{name_b}']:.4f}"
+                        for name_a, name_b in grad_cos_pairs
+                        if f"grad_cos_{name_a}_{name_b}" in grad_cos_logs
+                    )
+                    logger.info(
+                        f"Step {global_step}: GradNormRewardLoRA={reward_grad_norm_item:.6e}, "
+                        f"GradNormClipLoRA={clip_grad_norm_item:.6e}, "
+                        f"GradNormTrajLoRA={grad_norms['traj']:.6e}, "
+                        f"GradNormRegLoRA={grad_norms['reg']:.6e}, "
+                        f"GradNormRewardClipRatio={reward_grad_norm_item / (clip_grad_norm_item + 1e-12):.6e}, "
+                        f"cos:{cos_text}"
+                    )
 
-                    # run_quick_asr_eval(
-                    #     global_step=global_step,
-                    #     checkpoint_dir=checkpoint_dir,
-                    #     args=args,
-                    #     accelerator=accelerator,
-                    #     tokenizer=tokenizer,
-                    #     text_encoder=text_encoder,
-                    #     vae=vae,
-                    #     unet=unwrapped_unet,
-                    #     base_scheduler=base_scheduler,
-                    #     weight_dtype=weight_dtype,
-                    #     texture_render_model=texture_render_model,
-                    #     yolo_model=yolo_reward_model,
-                    # )
-        if stop_training:
-            break
+        if accelerator.sync_gradients:
+            global_step += 1
+            idx += 1
+            logs = {
+                "loss": loss.detach().item(),
+                "loss_reward": reward_loss.detach().item(),
+                "loss_reward_raw": loss_reward_active.detach().item(),
+                "loss_reg": loss_reg.detach().item(),
+                "loss_clip_score": loss_clip_score.detach().item(),
+                "loss_traj": loss_traj.detach().item(),
+                "loss_traj_raw": loss_traj_raw.detach().item(),
+                "loss_color": loss_color.detach().item(),
+                "color_dev": float(color_dev),
+                "loss_div": loss_div.detach().item(),
+                "div_max_sim": float(div_max_sim),
+                "traj_on": float(should_apply_traj_anchor),
+                "clip_score": clip_score.detach().item(),
+                "ClipScoreFull": clip_score_full.item(),
+                "reward": reward_value.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "FracBelowMargin": frac_below_margin.detach().item(),
+            }
+            logs.update(grad_norm_logs)
+            accelerator.log(logs, step=global_step)
+            if global_step >= args.max_train_steps:
+                break
+            # 每 N次 梯度步保存一次 LoRA 权重检查点，并进行评估
+            if (
+                accelerator.is_main_process
+                and global_step % args.checkpointing_steps == 0
+                and global_step > 500
+            ):
+                prune_checkpoints(args.output_dir, args.checkpoints_total_limit)
+                checkpoint_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped_unet = unwrap_model(accelerator, unet)
+                # unwrapped_unet = unwrap_model(accelerator, unet).to(torch.float32)
+                unet_lora_state_dict = convert_state_dict_to_diffusers(
+                    get_peft_model_state_dict(unwrapped_unet)
+                )
+                StableDiffusionXLPipeline.save_lora_weights(
+                    save_directory=checkpoint_dir,
+                    unet_lora_layers=unet_lora_state_dict,
+                )
+                torch.cuda.empty_cache()
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

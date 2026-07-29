@@ -3,14 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import nvdiffrast.torch as dr
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch import nn
-
-import nvdiffrast.torch as dr
 from pytorch3d.transforms.transform3d import RotateAxisAngle
-
+from torch import nn
 
 CARLA_MESH_YAW_FIX = 270.0
 CARLA_MESH_SCALE = 1.05

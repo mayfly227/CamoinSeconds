@@ -9,6 +9,7 @@ from utils.core import get_free_gpu, load_uv_mask
 from utils.loss import (
     color_distribution_loss,
     disable_lora_context,
+    diversity_repulsion_loss,
     lora_regularization,
     margin_detection_loss,
     soft_color_histogram,
@@ -17,7 +18,7 @@ from utils.loss import (
 
 try:
     get_free_gpu()
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     print(
         f"Warning: get_free_gpu() failed with error: {e}. Proceeding without setting CUDA_VISIBLE_DEVICES."
     )
@@ -27,9 +28,11 @@ import argparse
 import logging
 import random
 import shutil
+from collections import deque
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional  # noqa: UP035
 
 import diffusers
 import torch
@@ -58,7 +61,7 @@ from PIL import Image
 from transformers import AutoTokenizer, CLIPModel, CLIPProcessor, PretrainedConfig
 
 from meshrender import TextureRenderModel, tensor_rgb_to_pil
-from utils.cliputil import clip_text_image_similarity
+from utils.cliputil import clip_image_feature, clip_text_image_similarity
 
 check_min_version("0.37")
 logger = get_logger(__name__)
@@ -181,9 +184,21 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     # 是否启用梯度检查点节省显存
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--use_old_data", action="store_true")
+    parser.add_argument("--use_old_anchor", action="store_true")
     # 是否启用 xFormers 高效注意力
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", type=bool, default=False
+    )
+    parser.add_argument(
+        "--nvdiffrast_texture_filter",
+        type=str,
+        default="linear-mipmap-linear",
+        choices=["nearest", "linear", "linear-mipmap-nearest", "linear-mipmap-linear"],
+        help=(
+            "nvdiffrast texture filtering mode. Mipmap modes use UV derivatives "
+            "so each screen pixel propagates gradients to a wider UV footprint."
+        ),
     )
     # LoRA 秩
     parser.add_argument("--rank", type=int, default=64)
@@ -256,6 +271,22 @@ def parse_args():
         default=0.05,
         help="软直方图高斯分配宽度（[0,1] 色值尺度）。",
     )
+    # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
+    # CLIP-image 表征。默认关(weight=0)，关时完全不算 CLIP-image forward、零开销。
+    # ⚠️ 与攻击直接对抗(崩塌结构常是攻击最优)，margin/weight 要保守。
+    parser.add_argument(
+        "--diversity_weight",
+        type=float,
+        default=0.0,
+        help="多样性排斥权重(0=关，关时零开销)。",
+    )
+    parser.add_argument(
+        "--diversity_margin",
+        type=float,
+        default=0.6,
+        help="cosine 相似度阈值，sim>margin(太像)才推。崩塌时 sim≈0.9+。",
+    )
+    parser.add_argument("--diversity_bank_size", type=int, default=64)
     parser.add_argument(
         "--init_lora_path",
         type=str,
@@ -448,14 +479,6 @@ def ensure_required_paths(args):
         if not Path(path).exists():
             raise FileNotFoundError(f"`{label}` does not exist: {path}")
 
-
-def validate_triangular_range(name: str, low: float, high: float, mode: float) -> None:
-    if high < low:
-        raise ValueError(f"`{name}` has invalid bounds: {low} > {high}.")
-    if not low <= mode <= high:
-        raise ValueError(
-            f"`{name}_mode` must be within [`{name}_min`, `{name}_max`], got {mode}."
-        )
 
 
 def cycle_dataloader(dataloader):
@@ -720,7 +743,8 @@ def sample_latents_with_grad(
     K=19 表示只更新最后 1 步。若 args.bptt 传入多个候选值，每次采样随机选一个。
 
     返回 (images, anchor_states)：anchor_states 是本次去噪真实经过的
-    (x_t.detach(), t) 列表（仅收集 t ∈ [traj_anchor_t_min, traj_anchor_t_max]），
+    (x_t.detach(), t) 列表（凡 LoRA 激活的步都收，不在此按 t 过滤）。
+    t 窗口 [traj_anchor_t_min, traj_anchor_t_max] 的过滤在消费端做（选锚点时），
     供 on-trajectory anchor 使用——锚在生成真正访问过的状态上，而非随机高斯。
     """
     latent_size = resolution // 8
@@ -1174,7 +1198,7 @@ def main(args):
             background_fill_value=args.background_fill_value,
             use_carla_mesh_transform=args.use_carla_mesh_transform,
             # use_antialias=True,
-            # texture_filter_mode=args.nvdiffrast_texture_filter,
+            texture_filter_mode=args.nvdiffrast_texture_filter,
         )
     else:
         texture_render_model = TextureRenderModel(
@@ -1279,66 +1303,67 @@ def main(args):
         power=args.lr_power,
     )
     from data.dataset import make_loader
-
-    # root = [
-    #     "data/datas/origin/si54/sunny/6m",
-    #     "data/datas/origin/si54/sunny/8m",
-    #     "data/datas/origin/si54/sunny/10m",
-    #     "data/datas/origin/si54/sunny/12m",
-    #     "data/datas/origin/si139/sunny/6m",
-    #     "data/datas/origin/si139/sunny/8m",
-    #     "data/datas/origin/si139/sunny/10m",
-    #     "data/datas/origin/si139/sunny/12m",
-    # ]
-    root = [
-        "data/datas/origin/si103/day_clear/8m",
-        "data/datas/origin/si103/day_clear/10m",
-        "data/datas/origin/si103/day_clear/12m",
-        "data/datas/origin/si103/day_cloudy/8m",
-        "data/datas/origin/si103/day_cloudy/10m",
-        "data/datas/origin/si103/day_cloudy/12m",
-        "data/datas/origin/si103/night_clear/8m",
-        "data/datas/origin/si103/night_clear/10m",
-        "data/datas/origin/si103/night_clear/12m",
-        "data/datas/origin/si103/night_cloudy/8m",
-        "data/datas/origin/si103/night_cloudy/10m",
-        "data/datas/origin/si103/night_cloudy/12m",
-        "data/datas/origin/si139/sunny/6m",
-        "data/datas/origin/si139/sunny/8m",
-        "data/datas/origin/si139/sunny/10m",
-        "data/datas/origin/si139/sunny/12m",
-        "data/datas/origin/si47/day_clear/8m",
-        "data/datas/origin/si47/day_clear/10m",
-        "data/datas/origin/si47/day_clear/12m",
-        "data/datas/origin/si47/day_cloudy/8m",
-        "data/datas/origin/si47/day_cloudy/10m",
-        "data/datas/origin/si47/day_cloudy/12m",
-        "data/datas/origin/si47/night_clear/8m",
-        "data/datas/origin/si47/night_clear/10m",
-        "data/datas/origin/si47/night_clear/12m",
-        "data/datas/origin/si47/night_cloudy/8m",
-        "data/datas/origin/si47/night_cloudy/10m",
-        "data/datas/origin/si47/night_cloudy/12m",
-        "data/datas/origin/si54/sunny/6m",
-        "data/datas/origin/si54/sunny/8m",
-        "data/datas/origin/si54/sunny/10m",
-        "data/datas/origin/si54/sunny/12m",
-        "data/datas/origin/si70/day_clear/8m",
-        "data/datas/origin/si70/day_clear/10m",
-        "data/datas/origin/si70/day_clear/12m",
-        "data/datas/origin/si70/day_cloudy/8m",
-        "data/datas/origin/si70/day_cloudy/10m",
-        "data/datas/origin/si70/day_cloudy/12m",
-        "data/datas/origin/si70/night_clear/8m",
-        "data/datas/origin/si70/night_clear/10m",
-        "data/datas/origin/si70/night_clear/12m",
-        "data/datas/origin/si70/night_cloudy/8m",
-        "data/datas/origin/si70/night_cloudy/10m",
-        "data/datas/origin/si70/night_cloudy/12m",
-        "data/datas/origin/si75/sunny/8m",
-        "data/datas/origin/si75/sunny/10m",
-        "data/datas/origin/si75/sunny/12m",
-    ]
+    if args.use_old_data:
+        root = [
+            "data/datas/origin/si54/sunny/6m",
+            "data/datas/origin/si54/sunny/8m",
+            "data/datas/origin/si54/sunny/10m",
+            "data/datas/origin/si54/sunny/12m",
+            "data/datas/origin/si139/sunny/6m",
+            "data/datas/origin/si139/sunny/8m",
+            "data/datas/origin/si139/sunny/10m",
+            "data/datas/origin/si139/sunny/12m",
+        ]
+    else:
+        root = [
+            "data/datas/origin/si103/day_clear/8m",
+            "data/datas/origin/si103/day_clear/10m",
+            "data/datas/origin/si103/day_clear/12m",
+            "data/datas/origin/si103/day_cloudy/8m",
+            "data/datas/origin/si103/day_cloudy/10m",
+            "data/datas/origin/si103/day_cloudy/12m",
+            "data/datas/origin/si103/night_clear/8m",
+            "data/datas/origin/si103/night_clear/10m",
+            "data/datas/origin/si103/night_clear/12m",
+            "data/datas/origin/si103/night_cloudy/8m",
+            "data/datas/origin/si103/night_cloudy/10m",
+            "data/datas/origin/si103/night_cloudy/12m",
+            "data/datas/origin/si139/sunny/6m",
+            "data/datas/origin/si139/sunny/8m",
+            "data/datas/origin/si139/sunny/10m",
+            "data/datas/origin/si139/sunny/12m",
+            "data/datas/origin/si47/day_clear/8m",
+            "data/datas/origin/si47/day_clear/10m",
+            "data/datas/origin/si47/day_clear/12m",
+            "data/datas/origin/si47/day_cloudy/8m",
+            "data/datas/origin/si47/day_cloudy/10m",
+            "data/datas/origin/si47/day_cloudy/12m",
+            "data/datas/origin/si47/night_clear/8m",
+            "data/datas/origin/si47/night_clear/10m",
+            "data/datas/origin/si47/night_clear/12m",
+            "data/datas/origin/si47/night_cloudy/8m",
+            "data/datas/origin/si47/night_cloudy/10m",
+            "data/datas/origin/si47/night_cloudy/12m",
+            "data/datas/origin/si54/sunny/6m",
+            "data/datas/origin/si54/sunny/8m",
+            "data/datas/origin/si54/sunny/10m",
+            "data/datas/origin/si54/sunny/12m",
+            "data/datas/origin/si70/day_clear/8m",
+            "data/datas/origin/si70/day_clear/10m",
+            "data/datas/origin/si70/day_clear/12m",
+            "data/datas/origin/si70/day_cloudy/8m",
+            "data/datas/origin/si70/day_cloudy/10m",
+            "data/datas/origin/si70/day_cloudy/12m",
+            "data/datas/origin/si70/night_clear/8m",
+            "data/datas/origin/si70/night_clear/10m",
+            "data/datas/origin/si70/night_clear/12m",
+            "data/datas/origin/si70/night_cloudy/8m",
+            "data/datas/origin/si70/night_cloudy/10m",
+            "data/datas/origin/si70/night_cloudy/12m",
+            # "data/datas/origin/si75/sunny/8m",
+            # "data/datas/origin/si75/sunny/10m",
+            # "data/datas/origin/si75/sunny/12m",
+        ]
     carla_ds, carla_loader = make_loader(
         root=root,
         batch_size=args.num_reward_views,
@@ -1352,6 +1377,8 @@ def main(args):
     global_step = 0
     # per-prompt base 纹理颜色直方图缓存（颜色分布 anchor 用，惰性填充）
     base_color_hist_cache = {}
+    # 多样性排斥 memory bank：存 (prompt, clip_img_feat.detach())。默认关时不使用。
+    diversity_bank = deque(maxlen=args.diversity_bank_size)
     from data.prompt import ALL_PROMPTS
 
     total_prompts, selected_counts = build_prompt_list_from_specs(
@@ -1542,6 +1569,29 @@ def main(args):
                     (), device=accelerator.device, dtype=weight_dtype
                 )
                 color_dev = torch.zeros((), device=accelerator.device)
+            # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
+            # CLIP-image 表征。默认关(weight=0)——关时完全不算 CLIP-image forward。
+            if args.diversity_weight > 0:
+                cur_div_feat = clip_image_feature(
+                    clip_processor,
+                    clip_model,
+                    diffusion_images,
+                    accelerator.device,
+                    needgrad=True,
+                )  # (B, D) 归一化，有梯度
+                cur_prompt_key = prompts[0]
+                other_feats = [f for pk, f in diversity_bank if pk != cur_prompt_key]
+                bank_feats = torch.cat(other_feats, dim=0) if other_feats else None
+                loss_div_raw, div_max_sim = diversity_repulsion_loss(
+                    cur_div_feat, bank_feats, margin=args.diversity_margin
+                )
+                loss_div = args.diversity_weight * loss_div_raw
+                diversity_bank.append((cur_prompt_key, cur_div_feat.detach()))
+            else:
+                loss_div = torch.zeros(
+                    (), device=accelerator.device, dtype=weight_dtype
+                )
+                div_max_sim = torch.zeros((), device=accelerator.device)
             if args.use_diffusion_image_aug:
                 diffusion_images = roa_diffusion_image(diffusion_images)
 
@@ -1641,11 +1691,24 @@ def main(args):
                 args.traj_anchor_weight > 0 and random.random() < args.traj_anchor_prob
             )
             # on-trajectory anchor：从本次真实去噪轨迹里随机挑一个 (x_t, t) 作锚点，
-            # 约束"生成真正经过的状态"上 LoRA ≈ base（缓存为空时回退旧的随机高斯）。
-            if traj_anchor_states:
-                anchor_z_t, anchor_timestep = random.choice(traj_anchor_states)
+            # 约束"生成真正经过的状态"上 LoRA ≈ base。
+            # 关键：只在结构区 [t_min, t_max] 内选锚点，避开低 t 的 BPTT 攻击窗口。
+            # 否则锚会落在攻击真正干活的低 t 纹理步上，直接罚掉攻击本身（eps 偏离
+            # 在低 t = 攻击信号，同一 δ 在这里几乎恒触发 hinge，把正则变成反攻击力）。
+            # 窗口内无状态时回退 None → 函数内随机高斯 + randint(t_min,t_max) 兜底。
+            anchor_pool = [
+                (z, t)
+                for (z, t) in traj_anchor_states
+                if args.traj_anchor_t_min <= t <= args.traj_anchor_t_max
+            ]
+            if anchor_pool:
+                anchor_z_t, anchor_timestep = random.choice(anchor_pool)
             else:
                 anchor_z_t, anchor_timestep = None, None
+
+            if args.use_old_anchor:
+                anchor_z_t, anchor_timestep = None, None
+                
             if should_apply_traj_anchor:
                 loss_traj_hinge, loss_traj_dev = trajectory_anchor_loss(
                     unwrap_model(accelerator, unet),
@@ -1683,7 +1746,14 @@ def main(args):
                     (), device=accelerator.device, dtype=weight_dtype
                 )
 
-            loss = reward_loss + loss_clip_score + loss_reg + loss_traj + loss_color
+            loss = (
+                reward_loss
+                + loss_clip_score
+                + loss_reg
+                + loss_traj
+                + loss_color
+                + loss_div
+            )
             # loss = loss_traj
             # 清理无用的计算图部分，节省显存
             if (
@@ -1705,6 +1775,8 @@ def main(args):
                     "loss_traj_dev": loss_traj_dev.detach().item(),
                     "loss_color": loss_color.detach().item(),
                     "color_dev": float(color_dev),
+                    "loss_div": loss_div.detach().item(),
+                    "div_max_sim": float(div_max_sim),
                     "traj_on": float(should_apply_traj_anchor),
                     "clip_score": clip_score.detach().item(),
                     "clip_score_full": clip_score_full.item(),
@@ -1798,6 +1870,8 @@ def main(args):
                     f"LossReward_raw={loss_reward_active.detach().item():.4f}, "
                     f"LossColor={loss_color.detach().item():.6f}, "
                     f"ColorDev={float(color_dev):.4f}, "
+                    f"LossDiv={loss_div.detach().item():.6f}, "
+                    f"DivMaxSim={float(div_max_sim):.4f}, "
                     # f"LossReg={loss_reg.detach().item():.8f}, "
                     # f"LossClip={loss_clip_score.detach().item():.4f}, "
                     # f"LossTraj={loss_traj.detach().item():.8f}, "
@@ -1840,6 +1914,8 @@ def main(args):
                 "loss_traj_raw": loss_traj_raw.detach().item(),
                 "loss_color": loss_color.detach().item(),
                 "color_dev": float(color_dev),
+                "loss_div": loss_div.detach().item(),
+                "div_max_sim": float(div_max_sim),
                 "traj_on": float(should_apply_traj_anchor),
                 "clip_score": clip_score.detach().item(),
                 "ClipScoreFull": clip_score_full.item(),

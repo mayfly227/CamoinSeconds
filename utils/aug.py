@@ -166,11 +166,58 @@ class ROA(nn.Module):
         # 3) 光学系统
         # x = self.motionBlur(x)
 
-        # 4) 传感器
+        # # 4) 传感器
         # x = self.gaussianNoise(x)
 
         return x.clamp(0.0, 1.0)
 
+
+
+class ROA_FCA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.randomAffine = KR.RandomAffine(
+            degrees=(0.0, 0.0),
+            translate=(0.0, 0.0),
+            scale=(0.7, 1.2),
+            p=0.5,
+            # padding_mode='border',
+            keepdim=True,
+        )
+        self.colorJiggle = KR.ColorJiggle(
+            brightness=(0.85, 1.2),
+            contrast=(0.8, 1.25),
+            saturation=0.2,
+            hue=0.03,
+            p=0.5,
+            keepdim=True,
+        )
+        self.gaussianNoise = KR.RandomGaussianNoise(
+            mean=0.0, std=0.03, p=0.25, keepdim=True
+        )
+        self.motionBlur = KR.RandomMotionBlur(
+            kernel_size=(3, 7),
+            angle=(-30, 30),
+            direction=(-1, 1),
+            p=0.3,
+            keepdim=True,
+        )
+
+    def forward(self, x):
+        x = self.randomAffine(x)
+        if torch.isnan(x).any():
+            return x.clamp(0.0, 1.0)
+
+        x = self.colorJiggle(x)
+        # x = random.choice([self.fog, self.rain, self.snow])(x)
+
+        # 3) 光学系统
+        # x = self.motionBlur(x)
+
+        # # 4) 传感器
+        # x = self.gaussianNoise(x)
+
+        return x.clamp(0.0, 1.0)
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 def load_test_image(path):
