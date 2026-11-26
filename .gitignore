@@ -21,6 +21,7 @@ Thumbs.db
 # Logs
 logs/
 *.log
+nohup.out
 
 # Training outputs / checkpoints
 reward-lora-yolo/
