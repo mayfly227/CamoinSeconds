@@ -7,12 +7,10 @@ from prompt_poolcodex import PromptPool as PromptPoolCodex
 from utils.aug import ROA, ROADiffusionImage
 from utils.core import get_free_gpu, load_uv_mask
 from utils.loss import (
-    color_distribution_loss,
     disable_lora_context,
     diversity_repulsion_loss,
     lora_regularization,
     margin_detection_loss,
-    soft_color_histogram,
     trajectory_anchor_loss,
 )
 
@@ -249,27 +247,6 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     # 每隔多少个优化步记录一次各 loss 对 LoRA 参数的梯度范数；<=0 表示关闭
     parser.add_argument("--grad_norm_logging_steps", type=int, default=0)
-    # 颜色分布 anchor（软直方图）：只锁颜色分布、放开结构。per-prompt 锚 base 纹理。
-    parser.add_argument(
-        "--color_weight",
-        type=float,
-        default=0.0,
-        help="颜色分布 anchor 权重（0=关）。约束 LoRA 纹理颜色分布贴近 base。",
-    )
-    parser.add_argument(
-        "--color_budget",
-        type=float,
-        default=0.0,
-        help="δ_color（W1 尺度≈归一化色值平移量）。dev≤δ 免罚（允许小改颜色），"
-        "超出才罚。0=硬匹配。建议 0.05~0.15。",
-    )
-    parser.add_argument("--color_hist_bins", type=int, default=32)
-    parser.add_argument(
-        "--color_hist_sigma",
-        type=float,
-        default=0.05,
-        help="软直方图高斯分配宽度（[0,1] 色值尺度）。",
-    )
     # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
     # CLIP-image 表征。默认关(weight=0)，关时完全不算 CLIP-image forward、零开销。
     # ⚠️ 与攻击直接对抗(崩塌结构常是攻击最优)，margin/weight 要保守。
@@ -797,7 +774,7 @@ def sample_latents_with_grad(
 
     for step_idx, timestep in enumerate(scheduler.timesteps):
         t_int = int(timestep)
-        # disable_lora_all: 全程关 LoRA，用于生成 base 纹理（颜色 anchor 的锚点）。
+        # disable_lora_all: 全程关闭 LoRA，使用基础模型采样。
         lora_active = (not disable_lora_all) and (step_idx >= lora_start_step)
         lora_context = (
             nullcontext() if lora_active else disable_lora_context(adapter_state_model)
@@ -907,58 +884,6 @@ def _ddim_step(
         guided_noise_pred, timestep, latents, eta=eta, return_dict=False
     )[0]
     return latents.to(dtype=dtype)
-
-
-def get_base_color_hist(
-    cache: dict,
-    prompt_key: str,
-    unet,
-    vae,
-    scheduler,
-    prompt_embeds,
-    pooled_prompt_embeds,
-    negative_prompt_embeds,
-    negative_pooled_prompt_embeds,
-    add_time_ids,
-    device,
-    dtype,
-    resolution: int,
-    guidance_scale: float,
-    args,
-    uv_mask,
-    bins: int,
-    sigma: float,
-):
-    """
-    取（或惰性生成并缓存）某 prompt 的 base 纹理颜色直方图。
-
-    base = 全程关 LoRA 采样出的纹理（disable_lora_all=True）。颜色分布对
-    初始噪声不敏感（同 prompt 同色调），故每 prompt 只生成一次、缓存直方图
-    （几十个数），后续复用。key 用 prompt 字符串。
-    """
-    if prompt_key in cache:
-        return cache[prompt_key]
-    with torch.no_grad():
-        base_img, _ = sample_latents_with_grad(
-            unet,
-            vae,
-            scheduler,
-            prompt_embeds,
-            pooled_prompt_embeds,
-            negative_prompt_embeds,
-            negative_pooled_prompt_embeds,
-            add_time_ids,
-            device,
-            dtype,
-            1,
-            resolution,
-            guidance_scale,
-            args=args,
-            disable_lora_all=True,
-        )
-        hist = soft_color_histogram(base_img, uv_mask, bins, sigma).detach()
-    cache[prompt_key] = hist
-    return hist
 
 
 def prune_checkpoints(output_dir: str, total_limit: Optional[int]):
@@ -1382,8 +1307,6 @@ def main(args):
     )
 
     global_step = 0
-    # per-prompt base 纹理颜色直方图缓存（颜色分布 anchor 用，惰性填充）
-    base_color_hist_cache = {}
     # 多样性排斥 memory bank：存 (prompt, clip_img_feat.detach())。默认关时不使用。
     diversity_bank = deque(maxlen=args.diversity_bank_size)
     from data.prompt import ALL_PROMPTS
@@ -1534,48 +1457,6 @@ def main(args):
                     )
             else:
                 clip_score_full = clip_score.detach()
-            # 颜色分布 anchor：只锁颜色、放开结构。用未增强的 LoRA-on 纹理图，
-            # 逐 prompt 锚各自 base 纹理的颜色直方图（惰性生成缓存）。
-            if args.color_weight > 0:
-                base_hists = []
-                for i, prompt_key in enumerate(prompts):
-                    base_hists.append(
-                        get_base_color_hist(
-                            base_color_hist_cache,
-                            prompt_key,
-                            unet,
-                            vae,
-                            scheduler,
-                            prompt_embeds[i : i + 1],
-                            pooled_prompt_embeds[i : i + 1],
-                            negative_prompt_embeds[i : i + 1],
-                            negative_pooled_prompt_embeds[i : i + 1],
-                            add_time_ids[i : i + 1],
-                            accelerator.device,
-                            weight_dtype,
-                            args.resolution,
-                            args.guidance_scale,
-                            args,
-                            uv_mask,
-                            args.color_hist_bins,
-                            args.color_hist_sigma,
-                        )
-                    )
-                base_hist = torch.cat(base_hists, dim=0)
-                loss_color_raw, color_dev = color_distribution_loss(
-                    diffusion_images,
-                    base_hist,
-                    uv_mask,
-                    args.color_hist_bins,
-                    args.color_hist_sigma,
-                    budget=args.color_budget,
-                )
-                loss_color = args.color_weight * loss_color_raw
-            else:
-                loss_color = torch.zeros(
-                    (), device=accelerator.device, dtype=weight_dtype
-                )
-                color_dev = torch.zeros((), device=accelerator.device)
             # 跨 prompt 多样性排斥(memory-bank)：把当前纹理推离历史【不同 prompt】的
             # CLIP-image 表征。默认关(weight=0)——关时完全不算 CLIP-image forward。
             if args.diversity_weight > 0:
@@ -1758,7 +1639,6 @@ def main(args):
                 + loss_clip_score
                 + loss_reg
                 + loss_traj
-                + loss_color
                 + loss_div
             )
             # loss = loss_traj
@@ -1780,8 +1660,6 @@ def main(args):
                     "loss_traj": loss_traj.detach().item(),
                     "loss_traj_raw": loss_traj_raw.detach().item(),
                     "loss_traj_dev": loss_traj_dev.detach().item(),
-                    "loss_color": loss_color.detach().item(),
-                    "color_dev": float(color_dev),
                     "loss_div": loss_div.detach().item(),
                     "div_max_sim": float(div_max_sim),
                     "traj_on": float(should_apply_traj_anchor),
@@ -1875,8 +1753,6 @@ def main(args):
                     f"Step {global_step}: Loss={loss.detach().item():.4f}, "
                     f"LossReward={reward_loss.detach().item():.4f}, "
                     f"LossReward_raw={loss_reward_active.detach().item():.4f}, "
-                    f"LossColor={loss_color.detach().item():.6f}, "
-                    f"ColorDev={float(color_dev):.4f}, "
                     f"LossDiv={loss_div.detach().item():.6f}, "
                     f"DivMaxSim={float(div_max_sim):.4f}, "
                     # f"LossReg={loss_reg.detach().item():.8f}, "
@@ -1919,8 +1795,6 @@ def main(args):
                 "loss_clip_score": loss_clip_score.detach().item(),
                 "loss_traj": loss_traj.detach().item(),
                 "loss_traj_raw": loss_traj_raw.detach().item(),
-                "loss_color": loss_color.detach().item(),
-                "color_dev": float(color_dev),
                 "loss_div": loss_div.detach().item(),
                 "div_max_sim": float(div_max_sim),
                 "traj_on": float(should_apply_traj_anchor),
