@@ -242,120 +242,6 @@ def trajectory_anchor_loss(
     return mse, dev
 
 
-def soft_color_histogram(
-    images: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    bins: int = 32,
-    sigma: float = 0.05,
-) -> torch.Tensor:
-    """
-    Differentiable per-channel soft color histogram.
-
-    颜色分布是"空间无关"的统计量：像素怎么在空间上重排（=改结构/花纹）都
-    不改直方图，只有"用了哪些颜色、各占多少"变了才变。这正好实现"结构可
-    改、颜色分布要锁"。
-
-    Args:
-        images: (B, 3, H, W) in [0, 1].
-        mask:   UV mask, (H, W) / (1, H, W) / (1, 1, H, W). 只统计 mask 内像素
-                （车身纹理用到的区域）。None = 全图。会自动 resize 到图像分辨率。
-        bins:   每通道 bin 数。
-        sigma:  soft binning 高斯宽度（[0,1] 色值尺度）。略大于 bin 宽(1/bins)
-                使分配平滑可微。
-
-    Returns:
-        (B, 3, bins) 每通道归一化直方图（沿 bins 和为 1）。
-    """
-    if images.ndim != 4 or images.shape[1] != 3:
-        raise ValueError(f"`images` must be (B,3,H,W), got {tuple(images.shape)}")
-    B, C, H, W = images.shape
-    device, dtype = images.device, images.dtype
-
-    centers = torch.linspace(
-        0.5 / bins, 1.0 - 0.5 / bins, bins, device=device, dtype=dtype
-    )  # (bins,)
-
-    x = images.reshape(B, C, H * W, 1)  # (B,C,HW,1)
-    d = x - centers.reshape(1, 1, 1, bins)  # (B,C,HW,bins)
-    w = torch.exp(-0.5 * (d / sigma) ** 2)  # 高斯软分配
-    w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)  # partition of unity（每像素权重和=1）
-
-    if mask is not None:
-        m = mask
-        while m.ndim < 4:
-            m = m.unsqueeze(0)
-        m = m.to(device=device, dtype=dtype)
-        if m.shape[1] != 1:
-            m = m[:, :1]  # UV mask 各通道相同，取单通道
-        if m.shape[-2:] != (H, W):
-            m = F.interpolate(m, size=(H, W), mode="nearest")
-        m = m[:1].reshape(1, 1, H * W, 1)  # (1,1,HW,1) broadcast
-        w = w * m
-        denom = m.sum().clamp_min(1.0)
-        hist = w.sum(dim=2) / denom  # (B,C,bins)
-    else:
-        hist = w.mean(dim=2)  # (B,C,bins)
-
-    hist = hist / (hist.sum(dim=-1, keepdim=True) + 1e-8)
-    return hist
-
-
-def color_histogram_distance(
-    hist_a: torch.Tensor, hist_b: torch.Tensor
-) -> torch.Tensor:
-    """
-    Per-sample 1D Wasserstein(W1) distance between two per-channel color
-    histograms, averaged over channels.
-
-    用 W1（=|CDF 差|之和）而非 L2：颜色整体平移 Δ 时 W1 ≈ Δ（[0,1] 色值尺度），
-    对"小改颜色"的 budget 有直接物理含义；L2 对 bin 错位过敏、平移不可解释。
-
-    Args:
-        hist_a, hist_b: (B, C, bins) 归一化直方图。
-    Returns:
-        (B,) 每样本的颜色分布距离，尺度≈归一化色值的平移量。
-    """
-    cdf_a = torch.cumsum(hist_a, dim=-1)
-    cdf_b = torch.cumsum(hist_b, dim=-1)
-    w1 = (cdf_a - cdf_b).abs().mean(dim=-1)  # (B,C)
-    return w1.mean(dim=-1)  # (B,)
-
-
-def color_distribution_loss(
-    images: torch.Tensor,
-    base_hist: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    bins: int = 32,
-    sigma: float = 0.05,
-    budget: float = 0.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    颜色分布 anchor（带预算）：约束 LoRA 纹理的颜色分布贴近其 base 纹理，
-    只锁颜色、放开结构。per-prompt 使用（base_hist 是该 prompt 的 base 纹理
-    直方图）。
-
-    Args:
-        images:    (B,3,H,W) in [0,1]，LoRA-on 纹理图。
-        base_hist: (B,3,bins) 该 prompt 的 base 纹理软直方图（detached 缓存）。
-        mask:      UV mask。
-        budget:    δ_color（W1 尺度，≈归一化色值平移量）。dev≤δ 免罚（允许小改
-                   颜色），超出才平方 hinge。0 → 硬匹配（不建议）。
-
-    Returns:
-        (loss, dev)：dev 是本次颜色分布距离（detached，供调 δ_color / 日志）。
-    """
-    on_hist = soft_color_histogram(images, mask, bins, sigma)
-    base_hist = base_hist.to(device=on_hist.device, dtype=on_hist.dtype).detach()
-    dev = color_histogram_distance(on_hist, base_hist)  # (B,)
-    dev_mean = dev.mean()
-    if budget > 0.0:
-        over = (dev - budget).clamp_min(0.0)
-        loss = over.pow(2).mean()
-    else:
-        loss = dev_mean
-    return loss, dev_mean.detach()
-
-
 def diversity_repulsion_loss(
     cur_feat: torch.Tensor,
     bank_feats: Optional[torch.Tensor],
@@ -368,7 +254,7 @@ def diversity_repulsion_loss(
     margin（太像）才罚，hinge 有界排斥——不无限推远（无限推会毁攻击/自然），
     只要求"不要太像"。
 
-    ⚠️ 与颜色 anchor 不同：结构/整体表征的排斥和攻击【直接对抗】（因为"卵石阵"
+    ⚠️ 结构/整体表征的排斥和攻击【直接对抗】（因为"卵石阵"
     这类崩塌结构往往就是攻击最优）。margin/weight 要保守，盯着攻击别塌。
 
     Args:

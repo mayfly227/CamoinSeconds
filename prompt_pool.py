@@ -1,11 +1,11 @@
 import json
 import random
-from dataclasses import dataclass, field, asdict
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple  # noqa: UP035
 
-
-AXES: Dict[str, List[str]] = {
+AXES: dict[str, List[str]] = {
     "material": [
         "rusted metal",
         "weathered marble",
@@ -122,7 +122,7 @@ TEMPLATES: List[str] = [
     "a photograph of {material} with {pattern} in {color} tones, {style}, {context}",
     "a close-up shot of {material} surface showing {pattern}, dominated by {color}, {style}, {context}",
     "a macro photograph of {material} exhibiting {pattern} in {color}, rendered in a {style} style, {context}",
-    "an HDR photograph capturing {material} with intricate {pattern} in {color}, {style} aesthetic, {context}",
+    "an photograph capturing {material} with intricate {pattern} in {color}, {style} aesthetic, {context}",
 
     # --- (B) comma-separated tag streams (user-style) --------------------
     "{material}, {pattern}, {color}, {style}, {context}",
@@ -163,17 +163,6 @@ TEMPLATE_FAMILIES: Dict[str, Tuple[int, ...]] = {
 }
 
 
-# Neutral anchor prompts. Deliberately do NOT include adversarial-friendly
-# semantics; their gradient pulls Δ W back toward the base SD manifold.
-NEUTRAL_PROMPTS: List[str] = [
-    "a high-resolution photograph of a generic textured surface",
-    "a close-up of an abstract material sample, studio lighting",
-    "a plain photographic texture reference, neutral background",
-    "a macro photograph of an unspecified surface pattern",
-    "a flat texture swatch under even illumination",
-]
-
-
 # Free-form prompts written in user-style natural language. They deliberately
 # violate the AXES vocabulary AND the TEMPLATES sentence structure, to test
 # whether the LoRA preserves SDXL's open-vocabulary text conditioning.
@@ -210,7 +199,6 @@ class PromptSample:
     axes: Dict[str, str] = field(default_factory=dict)
     template_idx: int = -1
     split: str = "train"      # one of {train, eval_id, eval_comp, eval_ood}
-    is_neutral: bool = False
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -227,8 +215,6 @@ class PromptPool:
     ----
     seed:               RNG seed; controls (a) hold-out partition and
                         (b) sampling sequence.
-    p_neutral:          probability of returning a neutral anchor prompt
-                        from `sample_train`.
     holdout_per_axis:   how many values per axis are reserved as OOD.
     holdout_combos:     how many (material, context) pairs are reserved as
                         compositional eval (drawn from in-pool values only).
@@ -240,15 +226,11 @@ class PromptPool:
     def __init__(
         self,
         seed: int = 0,
-        p_neutral: float = 0.0,
         holdout_per_axis: int = 2,
         holdout_combos: int = 8,
         template_subset: Optional[Sequence[int]] = None,
     ):
-        if not 0.0 <= p_neutral <= 1.0:
-            raise ValueError("p_neutral must be in [0, 1]")
         self.seed = seed
-        self.p_neutral = p_neutral
         self._rng = random.Random(seed)
 
         # Deterministic split RNG, independent from sampling RNG.
@@ -284,15 +266,10 @@ class PromptPool:
     def sample_train(self) -> PromptSample:
         """Sample one training prompt.
 
-        With probability `p_neutral` returns a neutral anchor.
-        Otherwise samples each axis independently from `_train_values` and
-        rejects any sample whose (material, context) hits a comp hold-out
-        pair (rejection sampling, expected reject rate ≪ 1).
+        Samples each axis independently from `_train_values` and rejects
+        any sample whose (material, context) hits a comp hold-out pair
+        (rejection sampling, expected reject rate ≪ 1).
         """
-        if self._rng.random() < self.p_neutral:
-            text = self._rng.choice(NEUTRAL_PROMPTS)
-            return PromptSample(text=text, split="train", is_neutral=True)
-
         for _ in range(32):
             axes = {ax: self._rng.choice(self._train_values[ax])
                     for ax in self.AXIS_NAMES}
@@ -404,13 +381,11 @@ class PromptPool:
         }
         return {
             "seed": self.seed,
-            "p_neutral": self.p_neutral,
             "train_values": self._train_values,
             "ood_values": self._ood_values,
             "comp_pairs": [list(p) for p in self._comp_pairs],
             "templates": [TEMPLATES[i] for i in self._template_indices],
             "template_families": active_families,
-            "neutral_prompts": list(NEUTRAL_PROMPTS),
             "n_train_axis_combos": n_combos,
             "n_train_combos_after_holdout": max(0, n_combos - len(self._comp_pairs)
                 * max(1, len(self._train_values["color"]))
@@ -432,11 +407,10 @@ class PromptPool:
 # Convenience helper for the trainer
 # ---------------------------------------------------------------------------
 
-def build_default_pool(seed: int = 42, p_neutral: float = 0.10) -> PromptPool:
+def build_default_pool(seed: int = 42) -> PromptPool:
     """Default configuration used by `train_lora_sdxl.py`."""
     return PromptPool(
         seed=seed,
-        p_neutral=p_neutral,
         holdout_per_axis=2,
         holdout_combos=8,
     )
@@ -458,7 +432,6 @@ def _print_section(title: str, char: str = "=") -> None:
 if __name__ == "__main__":
     prompt_pool = PromptPool(
         seed=42,
-        p_neutral=0.0,
         holdout_per_axis=2,
         holdout_combos=8,
     )
@@ -472,7 +445,7 @@ if __name__ == "__main__":
     #   3. Held-out compositional pairs
     #   4. One render from EACH template family on the SAME axis values
     #      (so the user can compare surface forms directly)
-    #   5. 8 train samples drawn from the live sampler (showing neutral mix)
+    #   5. 8 train samples drawn from the live sampler
     #   6. One sample from each eval split
 
     pool = build_default_pool(seed=42)
@@ -526,15 +499,12 @@ if __name__ == "__main__":
             text = TEMPLATES[i].format(**fixed_axes)
             print(f"    [#{i:02d}] {text}")
 
-    # 5. Live sampler output (showing neutral mix)
-    _print_section("5. 8 live train samples (≈10% neutral)")
+    # 5. Live sampler output
+    _print_section("5. 8 live train samples")
     rng = random.Random(0)  # only for reproducible smoke test ordering
     for k in range(8):
         s = pool.sample_train()
-        if s.is_neutral:
-            print(f"  [#{k} NEUTRAL]  {s.text}")
-        else:
-            print(f"  [#{k} comp t={s.template_idx:02d}]  {s.text}")
+        print(f"  [#{k} comp t={s.template_idx:02d}]  {s.text}")
 
     # 6. One sample from each eval split
     _print_section("6. One sample from each evaluation split")
