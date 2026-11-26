@@ -76,3 +76,4 @@ ablationStudy*/*
 .*
 shortimescript
 plot
+*.sh
